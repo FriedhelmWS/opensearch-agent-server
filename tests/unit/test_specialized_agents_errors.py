@@ -27,22 +27,18 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture(autouse=True)
-def reset_opensearch_tools() -> Generator[None, None, None]:
-    """Reset _opensearch_tools before and after each test to ensure isolation."""
+def reset_mcp_client() -> Generator[None, None, None]:
+    """Reset _mcp_client before and after each test to ensure isolation."""
     # Save original state
-    original_tools = (
-        list(specialized_agents._opensearch_tools)
-        if specialized_agents._opensearch_tools
-        else []
-    )
+    original_client = specialized_agents._mcp_client
 
     # Reset before test
-    specialized_agents._opensearch_tools = []
+    specialized_agents._mcp_client = None
 
     yield
 
     # Restore original state after test
-    specialized_agents._opensearch_tools = original_tools
+    specialized_agents._mcp_client = original_client
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +55,7 @@ class TestSpecializedAgentsErrors:
     async def test_hypothesis_agent_tool_failure(self):
         """Test hypothesis agent when tool call fails."""
         # Should handle tool errors gracefully
-        specialized_agents._opensearch_tools = [MagicMock()]
+        specialized_agents._mcp_client = MagicMock()
 
         mock_agent = MagicMock()
         # Simulate tool failure during agent invocation
@@ -81,7 +77,7 @@ class TestSpecializedAgentsErrors:
     async def test_evaluation_agent_timeout(self):
         """Test evaluation agent timeout handling."""
         # Should timeout gracefully, emit error event
-        specialized_agents._opensearch_tools = [MagicMock()]
+        specialized_agents._mcp_client = MagicMock()
 
         mock_agent = MagicMock()
         # Simulate timeout during agent invocation
@@ -108,7 +104,7 @@ class TestSpecializedAgentsErrors:
         # Should handle missing data gracefully
         from agents.art import specialized_agents
 
-        specialized_agents._opensearch_tools = [MagicMock()]
+        specialized_agents._mcp_client = MagicMock()
 
         mock_agent = MagicMock()
         # Simulate missing data scenario - agent should handle this gracefully
@@ -134,7 +130,7 @@ class TestSpecializedAgentsErrors:
         # Should handle tool errors due to missing data gracefully
         from agents.art import specialized_agents
 
-        specialized_agents._opensearch_tools = [MagicMock()]
+        specialized_agents._mcp_client = MagicMock()
 
         mock_agent = MagicMock()
         # Simulate tool error when data is missing
@@ -160,20 +156,20 @@ class TestSpecializedAgentsErrors:
         # The agent should return an error message, not crash
         from agents.art import specialized_agents
 
-        # Ensure tools are empty (fixture handles this)
-        assert specialized_agents._opensearch_tools == []
+        # Ensure client is unset (fixture handles this)
+        assert specialized_agents._mcp_client is None
 
         # Test hypothesis agent without tools
         result = await specialized_agents.hypothesis_agent("test query")
-        assert "Error: OpenSearch tools not configured" in result
+        assert "Error: MCPClient not configured" in result
 
         # Test evaluation agent without tools
         result = await specialized_agents.evaluation_agent("test query")
-        assert "Error: OpenSearch tools not configured" in result
+        assert "Error: MCPClient not configured" in result
 
         # Test user behavior agent without tools
         result = await specialized_agents.user_behavior_analysis_agent("test query")
-        assert "Error: OpenSearch tools not configured" in result
+        assert "Error: MCPClient not configured" in result
 
     @pytest.mark.asyncio
     async def test_hypothesis_agent_agent_creation_error(self):
@@ -181,7 +177,7 @@ class TestSpecializedAgentsErrors:
         # Should handle agent creation errors gracefully
         from agents.art import specialized_agents
 
-        specialized_agents._opensearch_tools = [MagicMock()]
+        specialized_agents._mcp_client = MagicMock()
 
         # Simulate Agent creation failure using ExitStack to handle many patches
         stack = ExitStack()
@@ -213,7 +209,7 @@ class TestSpecializedAgentsErrors:
         # Should handle connection errors gracefully
         from agents.art import specialized_agents
 
-        specialized_agents._opensearch_tools = [MagicMock()]
+        specialized_agents._mcp_client = MagicMock()
 
         mock_agent = MagicMock()
         mock_agent.invoke_async = AsyncMock(
