@@ -133,6 +133,31 @@ class AgentOrchestrator:
             agent_name=name,
         )
 
+    @staticmethod
+    def _refresh_agent_headers(
+        agui_agent: AGUIStrandsAgent,
+        headers: dict[str, str] | None,
+    ) -> None:
+        """Patch the live httpx client with fresh credentials.
+
+        OBO tokens are short-lived (default 5 min).  Each Dashboards request
+        mints a fresh token.  The agent factories create an httpx client whose
+        default headers can be patched in-place via ``_MutableHeaders.update()``.
+        This updates the live HTTP session so all subsequent MCP requests
+        carry the new token — no MCP restart needed.
+        """
+        if headers is None:
+            return
+
+        mutable = getattr(agui_agent, "_mutable_headers", None)
+        if mutable is not None and hasattr(mutable, "update"):
+            mutable.update(headers)
+            log_debug_event(
+                logger,
+                "Patched httpx client with fresh credentials",
+                "orchestrator.headers_refreshed",
+            )
+
     async def run(
         self,
         input_data: RunAgentInput,
@@ -148,9 +173,10 @@ class AgentOrchestrator:
         Args:
             input_data: AG-UI ``RunAgentInput``.
             agent_name: Explicit agent name (skips routing).
-            headers: Optional HTTP headers to forward to the MCP server on
-                first agent creation (e.g. Authorization for OpenSearch
-                authentication).  Ignored once the agent is cached.
+            headers: Optional HTTP headers to forward to the MCP server
+                (e.g. Authorization with an OBO token).  On first use they
+                bootstrap the MCP connection; on subsequent requests they
+                are used to restart the MCP session with fresh credentials.
 
         Yields:
             AG-UI protocol events.
@@ -177,8 +203,12 @@ class AgentOrchestrator:
         # Reuse a cached AGUIStrandsAgent so that its _agents_by_thread dict
         # (and the Strands ConversationManager inside each per-thread agent)
         # persists across requests.  On first use, the factory is called with
-        # the caller's auth headers to initialise the MCP connection; those
-        # headers are reused for the lifetime of the cached agent.
+        # the caller's auth headers to initialise the MCP connection.
+        #
+        # On subsequent requests the caller may provide fresh credentials
+        # (e.g. a new OBO token).  If the underlying Strands agent exposes a
+        # ``_mutable_headers`` attribute the orchestrator updates it so the
+        # next MCP session automatically picks up the new token.
         agui_agent = self._cached_agui_agents.get(agent_name)
         if agui_agent is None:
             strands_agent = factory_info["factory"](headers)
@@ -188,6 +218,15 @@ class AgentOrchestrator:
                 description=factory_info["description"],
                 config=factory_info["config"],
             )
+            # Preserve the mutable headers handle and MCP client reference
+            # on the wrapper so we can refresh credentials on cached agents
+            # and prevent GC from closing the MCP session.
+            mutable = getattr(strands_agent, "_mutable_headers", None)
+            if mutable is not None:
+                agui_agent._mutable_headers = mutable
+            mcp_ref = getattr(strands_agent, "_mcp_client", None)
+            if mcp_ref is not None:
+                agui_agent._mcp_client = mcp_ref
             self._cached_agui_agents[agent_name] = agui_agent
             log_debug_event(
                 logger,
@@ -198,9 +237,14 @@ class AgentOrchestrator:
                 with_auth_headers=headers is not None,
             )
         else:
+            # Refresh credentials on the cached agent's MCP transport so
+            # that expired OBO tokens are replaced with the fresh one from
+            # the current request.
+            self._refresh_agent_headers(agui_agent, headers)
             log_debug_event(
                 logger,
-                f"Reusing cached agent '{agent_name}'",
+                f"Reusing cached agent '{agent_name}' "
+                f"(headers_refreshed={headers is not None})",
                 "orchestrator.agent_reused",
                 agent_name=agent_name,
             )
