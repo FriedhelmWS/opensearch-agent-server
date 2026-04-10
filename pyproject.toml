@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opensearch-agent-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "OpenSearch Agent Server for OpenSearch Dashboards — multi-agent orchestrator with page-context routing"
 readme = "README.md"
 license = "Apache-2.0"
@@ -66,12 +66,11 @@ markers = [
     "integration: integration tests",
 ]
 
+[tool.hatch.build.targets.sdist]
+include = ["src/"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/server", "src/orchestrator", "src/agents", "src/utils", "src/tools"]
 
-[tool.hatch.build.sources]
-"src/server" = "server"
-"src/orchestrator" = "orchestrator"
-"src/agents" = "agents"
-"src/utils" = "utils"
-"src/tools" = "tools"
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
