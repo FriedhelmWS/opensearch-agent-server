@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 # Used when BEDROCK_INFERENCE_PROFILE_ARN is not explicitly set.
 _DEFAULT_BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 
-DEFAULT_MCP_SERVER_URL = "http://localhost:3001/mcp"
+DEFAULT_MCP_SERVER_URL = "http://localhost:3001/mcp/"
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are a search relevance tuning orchestrator agent.
 
