@@ -236,8 +236,14 @@ DEFAULT_MIME_TYPE: str = "application/octet-stream"
 """Default MIME type used when file MIME type cannot be determined."""
 
 # Default user message when no message content is available
-DEFAULT_MCP_SERVER_URL: str = "http://localhost:3001/mcp"
+DEFAULT_MCP_SERVER_URL: str = "http://localhost:3001/mcp/"
 """Default URL for the OpenSearch MCP server (Streamable HTTP).
+
+The trailing slash is required: the upstream MCP Streamable HTTP endpoint
+is registered at ``/mcp/`` and responds to ``/mcp`` with a 307 redirect to
+``/mcp/``. Every redirected request costs an extra round-trip, which is
+non-trivial when the PER pipeline issues dozens of tool calls per run.
+Pin the trailing slash here so it's right by default.
 
 Overridden by the MCP_SERVER_URL environment variable.
 """

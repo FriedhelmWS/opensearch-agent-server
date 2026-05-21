@@ -305,6 +305,7 @@ def create_app(config_override: ServerConfig | None = None) -> FastAPI:
         # --- Orchestrator setup: register agent factories ---
         from agents.art.art_agent import create_art_agent
         from agents.default_agent import create_default_agent
+        from agents.per.per_agent import create_per_agent
         from orchestrator.registry import AgentRegistration, AgentRegistry
         from orchestrator.router import PageContextRouter
 
@@ -317,6 +318,15 @@ def create_app(config_override: ServerConfig | None = None) -> FastAPI:
             description="Search Relevance Tuning agent (ART) — hypothesis generation, "
             "evaluation, and UBI analysis.",
             page_contexts=["search_overview", "search-relevance", "searchRelevance"],
+            is_default=False,
+        ))
+
+        # Register PER agent (Explore page — root-cause analysis)
+        registry.register(AgentRegistration(
+            name="per",
+            description="Plan/Execute/Reflect root-cause-analysis agent for "
+            "OpenSearch observability.",
+            page_contexts=["explore"],
             is_default=False,
         ))
 
@@ -386,6 +396,20 @@ def create_app(config_override: ServerConfig | None = None) -> FastAPI:
             logger,
             "✓ ART agent factory registered",
             "ag_ui.art_agent_factory_ready",
+        )
+
+        # Register PER agent factory (Explore page — root-cause analysis).
+        # Auth is handled by OboAuth (contextvars) — no headers needed.
+        orchestrator.register_agent_factory(
+            name="per",
+            factory=lambda: create_per_agent(opensearch_url),
+            description="Plan/Execute/Reflect RCA agent for OpenSearch observability",
+            config=context_config,
+        )
+        log_info_event(
+            logger,
+            "✓ PER agent factory registered",
+            "ag_ui.per_agent_factory_ready",
         )
 
         yield

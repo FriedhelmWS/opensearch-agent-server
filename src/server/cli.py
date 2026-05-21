@@ -212,7 +212,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.with_mcp:
         _start_mcp_server(args.mcp_port, args.mcp_config)
         # Tell the agent server where to find MCP.
-        os.environ.setdefault("MCP_SERVER_URL", f"http://localhost:{args.mcp_port}/mcp")
+        os.environ.setdefault("MCP_SERVER_URL", f"http://localhost:{args.mcp_port}/mcp/")
 
     # 4. Configure logging (imports must come after load_dotenv).
     from server.logging_config import configure_logging, get_logging_config
