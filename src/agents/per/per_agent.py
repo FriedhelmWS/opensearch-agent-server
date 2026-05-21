@@ -1,10 +1,19 @@
-"""PER Agent — Plan / Execute / Reflect root-cause analysis for OpenSearch.
+"""PER Agent — generic Plan / Execute / Reflect investigation pipeline.
+
+Domain methodology (root-cause analysis, security forensics, performance
+regression bisect, etc.) is supplied at runtime by skills loaded from
+``skills/`` (see ``_load_skills`` in ``sub_agents``). The framework
+itself is domain-neutral; sub-agent prompts intentionally avoid
+hard-coding observability/RCA terminology beyond the structural
+contracts (evidence-tag syntax, JSON response shape, finalize-gate
+semantics) that the orchestrator code parses.
 
 Behavioral parity with ml-commons ``MLPlanExecuteAndReflectAgentRunner``:
-  - planner / reflector emit ``{"steps": [...], "result": "..."}`` JSON;
-    a non-empty ``result`` field signals completion (loop terminates),
-    otherwise the first step in ``steps`` is dispatched to the executor;
-  - executor system prompt mirrors ``EXECUTOR_RESPONSIBILITY``;
+  - planner / reflector emit JSON whose ``result`` field signals
+    completion (non-empty terminates the loop) and whose remaining
+    steps are dispatched to the executor;
+  - executor system prompt extends ``EXECUTOR_RESPONSIBILITY`` with
+    framework-specific output sections (QUERIES_EXECUTED, KNOWN_FACTS);
   - default ``max_steps`` matches the Java default (``20``).
 
 Loop topology (transparent Python orchestration — no opaque Graph):
@@ -30,6 +39,7 @@ import json
 import re
 import os
 import time
+from dataclasses import dataclass, field
 
 import boto3
 import httpx
@@ -58,23 +68,47 @@ _DEFAULT_BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 # Mirrors DEFAULT_MAX_STEPS_EXECUTED in MLPlanExecuteAndReflectAgentRunner.java.
 _MAX_STEPS = 20
 
-ORCHESTRATOR_SYSTEM_PROMPT = """You are an OpenSearch root-cause-analysis assistant
-for the Explore page.
+# After this many steps, finalize gates STOP rejecting the reflector's
+# result. The gates are designed to catch premature finalization; once the
+# investigation has run this long, the bigger risk is unbounded looping
+# (gate keeps adding new outstanding indicators that produce more findings
+# that produce more outstanding indicators). Gate rejection is a hint, not
+# a contract — past this threshold we accept whatever conclusion the
+# reflector reaches and surface gate violations as caveats in the log.
+_FINALIZE_GATE_SOFT_CAP = 8
 
-When the user reports an OpenSearch observability issue (slow query, high
-latency, red cluster, ingestion lag, error spikes, log/trace anomalies,
-etc.), call the `run_per_pipeline` tool ONCE with a concise problem
-statement that captures:
-  - the symptom
-  - the affected index / component (if known)
-  - the time window (if known)
+# Past this step count we stop letting the reflector decide whether to
+# continue. The next reflect call uses `_build_force_finalize_input`
+# instead of the normal reflect prompt — explicitly instructing the model
+# to produce its best `result` from existing evidence and ignore any
+# remaining outstanding probes. Whatever it returns (even partial) is
+# accepted. This exists because, with many critical rules cumulatively
+# biasing toward "do more probing", reflectors observed in practice keep
+# issuing voluntary `next_steps` long after they have decisive evidence —
+# the soft gate cap above only triggers when the reflector ATTEMPTS to
+# finalize, which it sometimes never does on its own.
+_FORCE_FINALIZE_STEPS = 8
 
-The tool returns a comprehensive RCA report. Return that report to the
-user verbatim — do NOT rewrite, summarize, paraphrase, condense, or
-reformat it. Do NOT prepend or append commentary, mitigation suggestions,
-or follow-up questions. The pipeline's report is already the deliverable;
-re-processing it doubles token consumption and risks truncating the
-output. Your only job is to faithfully relay the tool's return value.
+ORCHESTRATOR_SYSTEM_PROMPT = """You are an investigation orchestrator. Your role
+is to dispatch the user's investigation question to the plan→execute→
+reflect pipeline and faithfully relay the result.
+
+When the user reports a problem that calls for a structured investigation
+(an incident, anomaly, regression, outage, or any "why is this
+happening" question that requires evidence-based reasoning across
+available data), call the `run_per_pipeline` tool ONCE with a concise
+problem statement that captures:
+  - what is wrong (the symptom or observation)
+  - what entity / scope is affected (if known)
+  - the relevant time window (if known)
+
+The pipeline returns a comprehensive investigation report. Return that
+report to the user verbatim — do NOT rewrite, summarize, paraphrase,
+condense, or reformat it. Do NOT prepend or append commentary,
+mitigation suggestions, or follow-up questions. The pipeline's report is
+already the deliverable; re-processing it doubles token consumption and
+risks truncating the output. Your only job is to faithfully relay the
+tool's return value.
 
 If the tool returns an error message (e.g. "Max Steps Limit Reached" or
 "Planner produced no actionable plan"), surface that message verbatim as
@@ -122,20 +156,39 @@ def _parse_planner_output(text: str) -> tuple[list[str], str]:
     return steps, result
 
 
-def _parse_reflect_output(text: str) -> tuple[list[str], str]:
-    """Return ``(next_steps, result)`` from a reflect JSON response.
+@dataclass
+class ReflectDecision:
+    """Structured view of a reflect-phase JSON response."""
+
+    next_steps: list[str]
+    result: str
+    leading_candidate: str = ""
+    candidate_reason: str = ""
+    outlier_candidate: str = ""
+    outlier_reason: str = ""
+    direct_indicators_outstanding: list[str] = field(default_factory=list)
+    parked_symptoms_outstanding: list[str] = field(default_factory=list)
+
+
+def _parse_reflect_output(text: str) -> ReflectDecision:
+    """Return a ``ReflectDecision`` parsed from the reflector JSON.
 
     The reflect schema is a diff: a list of next steps to dispatch
     (``len > 1`` means independent and OK to fan out in parallel), or a
-    populated ``result`` to terminate. Returns ``([], "")`` on unparseable
-    output so the caller can decide to abort.
+    populated ``result`` to terminate. The schema also exposes the
+    leading candidate, the criterion that placed it there, and the list
+    of direct indicators that still need querying — these are used by
+    the orchestrator to enforce finalize gates without trusting the
+    reflector to self-police.
 
-    Tolerates a legacy ``next_step`` (singular string) field for forward
-    compatibility — earlier reflect prompts emitted that shape.
+    Returns an empty ``ReflectDecision`` on unparseable output so the
+    caller can decide to abort. Tolerates a legacy ``next_step``
+    (singular string) field for forward compatibility — earlier reflect
+    prompts emitted that shape.
     """
     parsed = _extract_json_blob(text)
     if not parsed:
-        return [], ""
+        return ReflectDecision(next_steps=[], result="")
     raw_steps = parsed.get("next_steps")
     steps: list[str] = []
     if isinstance(raw_steps, list):
@@ -148,7 +201,35 @@ def _parse_reflect_output(text: str) -> tuple[list[str], str]:
             steps = [legacy.strip()]
     result = parsed.get("result")
     result = result.strip() if isinstance(result, str) else ""
-    return steps, result
+    leading = parsed.get("leading_candidate")
+    leading = leading.strip() if isinstance(leading, str) else ""
+    reason = parsed.get("candidate_reason")
+    reason = reason.strip() if isinstance(reason, str) else ""
+    outlier = parsed.get("outlier_candidate")
+    outlier = outlier.strip() if isinstance(outlier, str) else ""
+    outlier_reason_raw = parsed.get("outlier_reason")
+    outlier_reason = (
+        outlier_reason_raw.strip() if isinstance(outlier_reason_raw, str) else ""
+    )
+
+    def _str_list(key: str) -> list[str]:
+        raw = parsed.get(key)
+        if isinstance(raw, list):
+            return [s.strip() for s in raw if isinstance(s, str) and s.strip()]
+        return []
+
+    indicators = _str_list("direct_indicators_outstanding")
+    parked = _str_list("parked_symptoms_outstanding")
+    return ReflectDecision(
+        next_steps=steps,
+        result=result,
+        leading_candidate=leading,
+        candidate_reason=reason,
+        outlier_candidate=outlier,
+        outlier_reason=outlier_reason,
+        direct_indicators_outstanding=indicators,
+        parked_symptoms_outstanding=parked,
+    )
 
 
 _FACTS_HEADER_RE = re.compile(r"(?im)^\s*KNOWN_FACTS\s*:\s*$")
@@ -289,6 +370,100 @@ def _coverage_tokens(text: str) -> set[str]:
 _PLAN_COVERAGE_THRESHOLD = 0.6
 
 
+def _finalize_gate_violations(
+    decision: ReflectDecision, artifacts: ArtifactStore
+) -> list[str]:
+    """Deterministic checks that must pass before ``result`` is accepted.
+
+    The reflector's prompt asks it to self-police several conditions
+    (direct evidence required, causal-direction walk recorded, no outstanding
+    indicators). These checks are duplicated in code so a reflector that
+    finalizes prematurely is overruled rather than trusted. Returns a
+    list of human-readable violation messages — empty list means the
+    finalization is allowed to proceed.
+    """
+    if not decision.result:
+        return []
+    violations: list[str] = []
+    candidate = decision.leading_candidate
+    if not candidate:
+        violations.append(
+            "leading_candidate is empty but result is populated — finalization "
+            "requires naming the entity the conclusion attributes the cause to."
+        )
+    elif not artifacts.has_direct_fact_for(candidate):
+        violations.append(
+            f"No KNOWN_FACTS bullet tagged [direct] mentions '{candidate}'. "
+            "Per critical rule 9, finalization requires at least one direct "
+            "fact for the named candidate; symptom-only attribution is forbidden."
+        )
+    if decision.direct_indicators_outstanding:
+        outstanding = ", ".join(decision.direct_indicators_outstanding)
+        violations.append(
+            "direct_indicators_outstanding is non-empty: "
+            f"{outstanding}. Per critical rule 9, query these before finalizing."
+        )
+    # Parked symptoms only block finalization when they touch the leading
+    # candidate. Symptoms about other entities are allowed to remain parked
+    # — the report can mention them as unresolved without blocking. This
+    # prevents the recursive-expansion failure mode where each new probe
+    # surfaces new entities, each of which produces new symptoms.
+    candidate_lc = candidate.lower() if candidate else ""
+    blocking_parked = [
+        s for s in decision.parked_symptoms_outstanding
+        if candidate_lc and candidate_lc in s.lower()
+    ]
+    if blocking_parked:
+        parked = "; ".join(blocking_parked)
+        violations.append(
+            "parked_symptoms_outstanding contains entries about the leading "
+            f"candidate: {parked}. Per critical rule 12, symptoms about the "
+            "leading candidate must be promoted to [direct]/[deviation] or "
+            "explicitly invalidated before finalizing."
+        )
+    reason_lc = decision.candidate_reason.lower()
+    if candidate and not any(
+        marker in reason_lc
+        for marker in (
+            "walk",
+            "outbound",
+            "downstream",
+            "upstream",
+            "neighbor",
+            "neighbour",
+            "dependency",
+        )
+    ):
+        violations.append(
+            "candidate_reason does not record a causal-direction walk "
+            "outcome. Per critical rule 8, the walk is mandatory before "
+            "finalizing — record in candidate_reason that you examined "
+            "the candidate's neighbors / dependencies and either confirm "
+            "no promotion or promote one of them."
+        )
+    if candidate and not any(
+        marker in reason_lc
+        for marker in (
+            "baseline",
+            "deviation",
+            "× ",
+            "x over",
+            "x baseline",
+            "% over",
+            "fold",
+        )
+    ):
+        violations.append(
+            "candidate_reason does not cite a relative deviation against "
+            "baseline. Per critical rule 11, ranking by absolute magnitude "
+            "is forbidden — candidate_reason must include a baseline "
+            "comparison (e.g., '+47× over baseline 0.3', '+3% over "
+            "baseline 13.8'). Query baseline values for the leading "
+            "candidate before finalizing."
+        )
+    return violations
+
+
 def _untouched_plan_steps(
     plan_steps: list[str], artifacts: ArtifactStore
 ) -> list[tuple[int, str, set[str]]]:
@@ -380,9 +555,50 @@ def _build_reflect_input(
             "scope-narrowing, not free-text findings):\n" + queries
         )
 
+    deviation_facts = artifacts.all_deviation_facts()
+    if deviation_facts:
+        sections.append(
+            "KNOWN_FACTS — [deviation] evidence (incident vs baseline "
+            "comparisons — the ONLY evidence eligible for ranking "
+            "candidates; rank by RELATIVE deviation here, never by "
+            "absolute magnitude):\n" + deviation_facts
+        )
+
+    direct_facts = artifacts.all_direct_facts()
+    if direct_facts:
+        sections.append(
+            "KNOWN_FACTS — [direct] evidence (these CAN support a final "
+            "attribution on their own; combine with [deviation] above "
+            "for ranking):\n" + direct_facts
+        )
+
+    symptom_facts = artifacts.all_symptom_facts()
+    if symptom_facts:
+        sections.append(
+            "KNOWN_FACTS — [symptom] evidence (PARKED HYPOTHESES — context "
+            "only, CANNOT name a mode by itself; each entry below MUST "
+            "appear in `parked_symptoms_outstanding` until it is either "
+            "promoted to [direct]/[deviation] by a follow-up query or "
+            "explicitly invalidated by another fact):\n" + symptom_facts
+        )
+
     facts = artifacts.all_facts()
-    if facts:
-        sections.append(f"KNOWN_FACTS (durable findings — do NOT rediscover):\n{facts}")
+    schema_facts: list[str] = []
+    for line in facts.splitlines():
+        lc = line.lower()
+        if (
+            "[direct]" in lc
+            or "[symptom]" in lc
+            or "[deviation]" in lc
+        ):
+            continue
+        schema_facts.append(line)
+    schema_block = "\n".join(schema_facts).strip()
+    if schema_block:
+        sections.append(
+            "KNOWN_FACTS — [schema] / unclassified (operational discoveries; "
+            "do NOT rediscover):\n" + schema_block
+        )
 
     latest = artifacts.full_findings(last_n=latest_n)
     if latest:
@@ -412,9 +628,114 @@ def _build_reflect_input(
         "Output the next step(s) to execute in `next_steps` (a list — "
         "prefer parallel dispatch when steps target independent data "
         "sources; otherwise return a single-element list), or finalize "
-        "with a comprehensive report in `result`. Never repeat a completed "
-        "step. Never propose work that contradicts KNOWN_FACTS. Honor the "
-        "PLAN COVERAGE WARNING above if present."
+        "with a comprehensive report in `result`. Always populate "
+        "`leading_candidate`, `candidate_reason`, `outlier_candidate`, "
+        "`outlier_reason`, `direct_indicators_outstanding`, and "
+        "`parked_symptoms_outstanding` so the orchestrator can verify "
+        "finalize gates. Never repeat a completed step. Never propose "
+        "work that contradicts KNOWN_FACTS. Honor the PLAN COVERAGE "
+        "WARNING above if present. Finalization will be REJECTED by the "
+        "orchestrator if ANY of: (a) the leading_candidate has no "
+        "[direct] evidence, (b) direct_indicators_outstanding is "
+        "non-empty, (c) candidate_reason does not record a causal-"
+        "direction walk outcome, (d) candidate_reason does not cite a "
+        "RELATIVE deviation against a comparable reference (absolute "
+        "magnitude is forbidden), or (e) parked_symptoms_outstanding "
+        "is non-empty. Use the `outlier_candidate` slot every turn to "
+        "keep the second-most-anomalous entity visible — confirmation-"
+        "bias collapse onto the leading candidate is a recurring miss "
+        "path."
+    )
+    return "\n\n".join(sections)
+
+
+def _build_force_finalize_input(
+    objective: str,
+    plan_steps: list[str],
+    artifacts: ArtifactStore,
+) -> str:
+    """Reflect prompt that forces the model to produce a final report now.
+
+    Used after the investigation has run long enough that further probing
+    is more likely to be confirmation-driven scope expansion than to
+    surface new evidence. Differs from the normal reflect prompt in three
+    ways:
+      - it tells the model that next_steps will be IGNORED;
+      - it explicitly suspends critical rules 5–13 and the finalize gates;
+      - it allows the model to acknowledge unknowns and outstanding
+        questions inside the `result` text rather than dispatching more
+        steps to chase them.
+    """
+    sections = [f"Objective:\n{objective}"]
+
+    if plan_steps:
+        plan_block = "\n".join(f"- {step}" for step in plan_steps)
+        sections.append(
+            f"Original plan (for context only):\n{plan_block}"
+        )
+
+    queries = artifacts.all_queries()
+    if queries:
+        sections.append(
+            "QUERIES_EXECUTED so far:\n" + queries
+        )
+
+    deviation_facts = artifacts.all_deviation_facts()
+    if deviation_facts:
+        sections.append(
+            "KNOWN_FACTS — [deviation] (incident vs baseline ratios):\n"
+            + deviation_facts
+        )
+
+    direct_facts = artifacts.all_direct_facts()
+    if direct_facts:
+        sections.append(
+            "KNOWN_FACTS — [direct] evidence:\n" + direct_facts
+        )
+
+    symptom_facts = artifacts.all_symptom_facts()
+    if symptom_facts:
+        sections.append(
+            "KNOWN_FACTS — [symptom] evidence (context only):\n"
+            + symptom_facts
+        )
+
+    facts = artifacts.all_facts()
+    schema_lines = [
+        line for line in facts.splitlines()
+        if "[direct]" not in line.lower()
+        and "[symptom]" not in line.lower()
+        and "[deviation]" not in line.lower()
+    ]
+    schema_block = "\n".join(schema_lines).strip()
+    if schema_block:
+        sections.append(
+            "KNOWN_FACTS — [schema] / unclassified:\n" + schema_block
+        )
+
+    sections.append(
+        "FORCE FINALIZE: the investigation has run long enough that "
+        "further probing is unlikely to change the conclusion more than "
+        "it lengthens the run. You MUST now produce your best `result` "
+        "from the evidence above. Critical rules 5–13 and the normal "
+        "finalize gates are suspended for this turn — your `next_steps` "
+        "will be IGNORED. Do not propose more probes.\n\n"
+        "In `result`, write a comprehensive report that:\n"
+        "1. Names your best top candidate(s) with the relative-deviation "
+        "evidence that places them.\n"
+        "2. Cites the specific [deviation] / [direct] facts that ground "
+        "each named candidate.\n"
+        "3. Acknowledges what could not be determined from available "
+        "evidence (unprobed dimensions, missing baselines, etc.) — these "
+        "are caveats inside the report, NOT reasons to keep investigating.\n"
+        "4. Distinguishes the entity that is the actual cause from "
+        "entities where the symptom merely surfaces, per the evidence "
+        "at hand; if the distinction is genuinely undetermined, say so.\n\n"
+        "Populate `leading_candidate`, `candidate_reason`, "
+        "`outlier_candidate`, `outlier_reason` for the audit log, and "
+        "leave `next_steps` and `direct_indicators_outstanding` and "
+        "`parked_symptoms_outstanding` empty. The result you produce now "
+        "is what will be returned to the user."
     )
     return "\n\n".join(sections)
 
@@ -520,11 +841,13 @@ def create_per_agent(opensearch_url: str) -> Agent:
     @monitored_tool(
         name="run_per_pipeline",
         description=(
-            "Run the plan→execute→reflect root-cause-analysis pipeline for an "
-            "OpenSearch observability issue. Pass a concise problem statement "
-            "(symptom, affected index/component, time window). Returns a "
-            "comprehensive RCA report describing every step, findings, and "
-            "the final conclusion."
+            "Run the plan→execute→reflect investigation pipeline. Pass a "
+            "concise problem statement (what is wrong, what entity/scope "
+            "is affected, time window). Returns a comprehensive "
+            "investigation report describing every step, findings, and "
+            "the final conclusion. Domain methodology (e.g. for root-cause "
+            "analysis, security forensics, performance regression) is "
+            "loaded from the agent's installed skills at runtime."
         ),
     )
     async def run_per_pipeline(problem_statement: str) -> str:
@@ -640,22 +963,134 @@ def create_per_agent(opensearch_url: str) -> Agent:
             )
 
             reflect_agent = build_reflect_agent()
-            # Show the reflector full findings for every artifact in the
-            # batch we just completed, not just the most recent one — they
-            # were dispatched as a unit and must be reasoned about as a unit.
-            reflect_prompt = _build_reflect_input(
-                objective=problem_statement,
-                plan_steps=plan_steps,
-                artifacts=artifacts,
-                latest_n=batch_size,
-            )
+            force_finalize = steps_executed >= _FORCE_FINALIZE_STEPS
+            if force_finalize:
+                log_warning_event(
+                    logger,
+                    f"[per] force-finalize triggered at step {steps_executed}",
+                    "per.pipeline.force_finalize",
+                    steps_executed=steps_executed,
+                    threshold=_FORCE_FINALIZE_STEPS,
+                )
+                reflect_prompt = _build_force_finalize_input(
+                    objective=problem_statement,
+                    plan_steps=plan_steps,
+                    artifacts=artifacts,
+                )
+            else:
+                # Show the reflector full findings for every artifact in
+                # the batch we just completed, not just the most recent
+                # one — they were dispatched as a unit and must be
+                # reasoned about as a unit.
+                reflect_prompt = _build_reflect_input(
+                    objective=problem_statement,
+                    plan_steps=plan_steps,
+                    artifacts=artifacts,
+                    latest_n=batch_size,
+                )
             reflect_result, _, _, _ = await _run_phase(
                 reflect_agent, reflect_prompt, "reflect", steps_executed
             )
             last_reflect_text = str(reflect_result)
-            next_steps, final_result = _parse_reflect_output(last_reflect_text)
+            decision = _parse_reflect_output(last_reflect_text)
 
-            if final_result:
+            # Under force-finalize, whatever the model returns is
+            # accepted as the final report — gates are suspended and
+            # next_steps are ignored. If the model returned an empty
+            # `result` despite the explicit instruction, fall back to
+            # surfacing the raw text so the user gets something.
+            if force_finalize:
+                final_text = decision.result or last_reflect_text or "(empty force-finalize response)"
+                total_ms = int((time.perf_counter() - pipeline_started) * 1000)
+                log_info_event(
+                    logger,
+                    "[per] pipeline complete (force-finalized)",
+                    "per.pipeline.finish",
+                    steps_executed=steps_executed,
+                    total_elapsed_ms=total_ms,
+                    leading_candidate=decision.leading_candidate,
+                    forced=True,
+                )
+                return final_text
+
+            if decision.result:
+                violations = _finalize_gate_violations(decision, artifacts)
+                # Past the soft cap, accept the reflector's finalization
+                # even if gates would reject it. Gate rejection is meant to
+                # catch premature finalization (one or two cycles in); past
+                # ~8 steps the bigger risk is unbounded looping where each
+                # gate-driven follow-up produces new outstanding indicators
+                # that produce more follow-ups. Surface the unmet gates as
+                # warnings in the log rather than blocking the user.
+                if violations and steps_executed >= _FINALIZE_GATE_SOFT_CAP:
+                    log_warning_event(
+                        logger,
+                        "[per] finalize gates not satisfied but soft cap "
+                        "reached; accepting result with caveats",
+                        "per.pipeline.finalize_soft_cap",
+                        steps_executed=steps_executed,
+                        violation_count=len(violations),
+                        violations=violations,
+                        leading_candidate=decision.leading_candidate,
+                    )
+                    violations = []
+                if violations:
+                    log_warning_event(
+                        logger,
+                        "[per] finalize gates rejected reflector's result; "
+                        "forcing continued investigation",
+                        "per.pipeline.finalize_rejected",
+                        steps_executed=steps_executed,
+                        violation_count=len(violations),
+                        leading_candidate=decision.leading_candidate,
+                    )
+                    # Synthesize follow-up steps. We can have multiple
+                    # categories of binding violation at once — outstanding
+                    # indicators, parked symptoms, missing baseline / walk.
+                    # Prefer dispatching the structured items first, fall
+                    # back to a coaching step if none apply.
+                    forced: list[str] = []
+                    for indicator in decision.direct_indicators_outstanding:
+                        forced.append(
+                            "Query the following outstanding direct indicator "
+                            f"for the leading candidate "
+                            f"'{decision.leading_candidate}': {indicator}"
+                        )
+                    for symptom in decision.parked_symptoms_outstanding:
+                        forced.append(
+                            "Resolve this parked symptom — either query for "
+                            "evidence that promotes it to [direct] / "
+                            "[deviation], or query for evidence that "
+                            f"explicitly invalidates it. Symptom: {symptom}"
+                        )
+                    if forced:
+                        pending_steps = forced
+                    else:
+                        # The reflector wanted to finalize but the violation
+                        # is in `candidate_reason` shape (missing causal
+                        # walk or missing baseline citation). Coach it
+                        # explicitly without prescribing domain specifics —
+                        # the relevant skill (if any) carries those.
+                        pending_steps = [
+                            "The previous reflect attempt to finalize was "
+                            "rejected by the finalize gate. Violations:\n- "
+                            + "\n- ".join(violations)
+                            + "\n\nProbe the leading candidate "
+                            f"'{decision.leading_candidate or '(none named)'}' "
+                            "directly to produce [direct] / [deviation] "
+                            "evidence: query the candidate's own signals "
+                            "with baseline comparison, examine its "
+                            "dependencies / neighbors for the causal-"
+                            "direction walk, and ensure the next "
+                            "candidate_reason cites a RELATIVE deviation "
+                            "against baseline (not an absolute value). "
+                            "If a domain skill applies to this "
+                            "investigation, follow its guidance for what "
+                            "counts as direct evidence and what neighbors "
+                            "to walk."
+                        ]
+                    continue
+
                 total_ms = int((time.perf_counter() - pipeline_started) * 1000)
                 log_info_event(
                     logger,
@@ -663,10 +1098,11 @@ def create_per_agent(opensearch_url: str) -> Agent:
                     "per.pipeline.finish",
                     steps_executed=steps_executed,
                     total_elapsed_ms=total_ms,
+                    leading_candidate=decision.leading_candidate,
                 )
-                return final_result
+                return decision.result
 
-            if not next_steps:
+            if not decision.next_steps:
                 log_warning_event(
                     logger,
                     "[per] reflector returned no next_steps and no result",
@@ -675,7 +1111,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 )
                 break
 
-            pending_steps = next_steps
+            pending_steps = decision.next_steps
 
         # Loop exhausted without a final result — mirror the Java runner's
         # "Max Steps Limit" message and surface the last reflector output.

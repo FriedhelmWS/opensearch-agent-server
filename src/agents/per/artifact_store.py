@@ -129,6 +129,66 @@ class ArtifactStore:
                 lines.append(f"- [{artifact.id}] {query}")
         return "\n".join(lines)
 
+    def _facts_with_prefix(self, prefix: str) -> str:
+        prefix_lc = prefix.lower()
+        if not self._artifacts:
+            return ""
+        lines: list[str] = []
+        for artifact in self._artifacts:
+            for fact in artifact.facts:
+                if fact.lower().lstrip().startswith(prefix_lc):
+                    lines.append(f"- [{artifact.id}] {fact}")
+        return "\n".join(lines)
+
+    def all_deviation_facts(self) -> str:
+        """Render only ``[deviation]``-tagged facts.
+
+        Deviation facts cite both incident and baseline values for a
+        component, making relative-deviation ranking possible. They are
+        the only evidence eligible to rank candidates without succumbing
+        to magnitude bias (per the investigation skill's rank-by-relative
+        rule).
+        """
+        return self._facts_with_prefix("[deviation]")
+
+    def all_direct_facts(self) -> str:
+        """Render only ``[direct]``-tagged facts.
+
+        Direct facts are evidence whose presence implies a specific failure
+        mode (per the investigation skill C.1: a resource gauge near its
+        limit, a log message that names a class of failure unambiguously,
+        a structural trace signature). They are the only kind of evidence
+        that can name a root cause; symptom evidence cannot.
+        """
+        return self._facts_with_prefix("[direct]")
+
+    def all_symptom_facts(self) -> str:
+        """Render only ``[symptom]``-tagged facts.
+
+        Symptom facts are consistent with the leading hypothesis but also
+        consistent with several other modes (generic error / exception
+        log lines, "downstream timed out", "connection refused"). They
+        are CONTEXT only — they cannot name a mode by themselves.
+        """
+        return self._facts_with_prefix("[symptom]")
+
+    def has_direct_fact_for(self, candidate: str) -> bool:
+        """Whether any ``[direct]`` fact mentions the candidate component.
+
+        Used by the finalize gate to refuse declaring a root cause whose
+        only support is symptom evidence. ``candidate`` is matched
+        case-insensitively against the bullet text.
+        """
+        if not candidate:
+            return False
+        needle = candidate.lower()
+        for artifact in self._artifacts:
+            for fact in artifact.facts:
+                lc = fact.lower().lstrip()
+                if lc.startswith("[direct]") and needle in lc:
+                    return True
+        return False
+
     def all_facts(self) -> str:
         """Render every recorded structured fact as a flat bullet list.
 
