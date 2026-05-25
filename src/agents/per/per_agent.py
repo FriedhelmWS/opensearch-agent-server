@@ -51,6 +51,8 @@ from strands.tools.mcp import MCPClient
 
 from agents.per.artifact_store import ArtifactStore
 from agents.per.sub_agents import (
+    PlanOutput,
+    ReflectOutput,
     build_execute_agent,
     build_plan_agent,
     build_reflect_agent,
@@ -65,6 +67,15 @@ logger = get_logger(__name__)
 
 _DEFAULT_BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 
+# Default model for the executor sub-agent. Executor work (issue queries,
+# transcribe results into KNOWN_FACTS) is mechanical and does not benefit
+# from the heavier reasoning model the planner / reflector use, so we
+# default it to the same Sonnet ID as the orchestrator fallback. Override
+# per-deployment by setting ``BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN`` to
+# any inference-profile ARN in the environment — Sonnet 4.6 is a typical
+# choice when ``BEDROCK_INFERENCE_PROFILE_ARN`` points at Opus.
+_DEFAULT_EXECUTOR_BEDROCK_MODEL_ID = _DEFAULT_BEDROCK_MODEL_ID
+
 # Mirrors DEFAULT_MAX_STEPS_EXECUTED in MLPlanExecuteAndReflectAgentRunner.java.
 _MAX_STEPS = 20
 
@@ -77,17 +88,29 @@ _MAX_STEPS = 20
 # reflector reaches and surface gate violations as caveats in the log.
 _FINALIZE_GATE_SOFT_CAP = 8
 
-# Past this step count we stop letting the reflector decide whether to
-# continue. The next reflect call uses `_build_force_finalize_input`
-# instead of the normal reflect prompt — explicitly instructing the model
-# to produce its best `result` from existing evidence and ignore any
-# remaining outstanding probes. Whatever it returns (even partial) is
-# accepted. This exists because, with many critical rules cumulatively
-# biasing toward "do more probing", reflectors observed in practice keep
-# issuing voluntary `next_steps` long after they have decisive evidence —
-# the soft gate cap above only triggers when the reflector ATTEMPTS to
-# finalize, which it sometimes never does on its own.
-_FORCE_FINALIZE_STEPS = 8
+# Hard fallback step count. If we hit this without converging, force
+# finalize regardless of state. This is a safety net for cases where
+# the convergence-based triggers below somehow fail.
+_FORCE_FINALIZE_STEPS = 12
+
+# Number of consecutive reflect rounds with no new [direct] or [deviation]
+# fact at which we treat the investigation as stagnant and switch to the
+# force-finalize prompt. Investigations that produce evidence are allowed
+# to run; investigations that don't, aren't. This handles Run-6-style
+# "reflector voluntarily keeps adding probes" failure where the reflector
+# never tries to finalize on its own — once new high-grade evidence
+# stops arriving, further probing is unlikely to change the conclusion.
+_STAGNATION_ROUNDS_FORCE = 2
+
+# Number of consecutive reflect rounds during which the count of
+# untouched original plan steps does NOT decrease, after which the
+# reflect prompt gets a PLAN STAGNATION nudge. Captures the failure
+# mode where the reflector keeps producing high-grade facts (so
+# stagnation doesn't fire) but does so by exploring side-paths that
+# bypass the original plan entirely — its candidate set drifts off the
+# investigation's intended scope. Detection is deterministic: it reuses
+# the existing ``_untouched_plan_steps`` token-coverage check.
+_PLAN_STAGNATION_ROUNDS_NUDGE = 3
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are an investigation orchestrator. Your role
 is to dispatch the user's investigation question to the plan→execute→
@@ -141,10 +164,12 @@ def _extract_json_blob(text: str) -> dict | None:
 
 
 def _parse_planner_output(text: str) -> tuple[list[str], str]:
-    """Return ``(steps, result)`` from a planner JSON response.
+    """Legacy fallback: regex-extract a JSON blob from raw planner text.
 
-    Falls back to ``([], "")`` on unparseable output so the loop can decide
-    to terminate fail-closed rather than spin on garbage.
+    Used only if the structured-output tool call did NOT land (network
+    blip, model went off-protocol, etc.). Normal path is
+    :func:`_planner_decision_from_result` which reads the validated
+    Pydantic instance off the AgentResult.
     """
     parsed = _extract_json_blob(text)
     if not parsed:
@@ -154,6 +179,23 @@ def _parse_planner_output(text: str) -> tuple[list[str], str]:
     result = parsed.get("result")
     result = result.strip() if isinstance(result, str) else ""
     return steps, result
+
+
+def _planner_decision_from_result(result) -> tuple[list[str], str]:
+    """Read planner decision off an AgentResult.
+
+    Strands' ``structured_output_model`` parameter forces the model to
+    invoke a generated tool whose input matches :class:`PlanOutput`; the
+    validated instance is exposed at ``result.structured_output``. We
+    prefer that path because the schema is enforced server-side; if it's
+    missing (extremely rare — model went off-protocol despite forcing),
+    fall back to the legacy regex extractor on the raw text.
+    """
+    so = getattr(result, "structured_output", None)
+    if isinstance(so, PlanOutput):
+        steps = [s.strip() for s in so.steps if isinstance(s, str) and s.strip()]
+        return steps, (so.result or "").strip()
+    return _parse_planner_output(str(result))
 
 
 @dataclass
@@ -170,8 +212,35 @@ class ReflectDecision:
     parked_symptoms_outstanding: list[str] = field(default_factory=list)
 
 
+def _reflect_decision_from_result(result) -> ReflectDecision:
+    """Read reflector decision off an AgentResult.
+
+    Same contract as :func:`_planner_decision_from_result`: prefer the
+    validated Pydantic instance (:class:`ReflectOutput`) attached by
+    Strands' structured-output mechanism, fall back to the legacy regex
+    parser only when the tool call somehow did not happen.
+    """
+    so = getattr(result, "structured_output", None)
+    if isinstance(so, ReflectOutput):
+        return ReflectDecision(
+            next_steps=[s.strip() for s in so.next_steps if isinstance(s, str) and s.strip()],
+            result=(so.result or "").strip(),
+            leading_candidate=(so.leading_candidate or "").strip(),
+            candidate_reason=(so.candidate_reason or "").strip(),
+            outlier_candidate=(so.outlier_candidate or "").strip(),
+            outlier_reason=(so.outlier_reason or "").strip(),
+            direct_indicators_outstanding=[
+                s.strip() for s in so.direct_indicators_outstanding if isinstance(s, str) and s.strip()
+            ],
+            parked_symptoms_outstanding=[
+                s.strip() for s in so.parked_symptoms_outstanding if isinstance(s, str) and s.strip()
+            ],
+        )
+    return _parse_reflect_output(str(result))
+
+
 def _parse_reflect_output(text: str) -> ReflectDecision:
-    """Return a ``ReflectDecision`` parsed from the reflector JSON.
+    """Legacy fallback: regex-extract a JSON blob from raw reflector text.
 
     The reflect schema is a diff: a list of next steps to dispatch
     (``len > 1`` means independent and OK to fan out in parallel), or a
@@ -524,6 +593,7 @@ def _build_reflect_input(
     plan_steps: list[str],
     artifacts: ArtifactStore,
     latest_n: int = 1,
+    plan_stagnation_rounds: int = 0,
 ) -> str:
     """Assemble the reflect-phase prompt with bounded context.
 
@@ -622,6 +692,24 @@ def _build_reflect_input(
             "if independent) or, in a future reflect call, justify skipping "
             "by citing the specific KNOWN_FACT that invalidates each.\n"
             + "\n".join(lines)
+        )
+
+    if untouched and plan_stagnation_rounds >= _PLAN_STAGNATION_ROUNDS_NUDGE:
+        # Untouched-step count has not decreased for several reflect
+        # rounds. Even if the investigation is producing high-grade
+        # facts, it's exploring side-paths instead of completing the
+        # planned scope. Strong-arm the reflector back onto the plan.
+        sections.append(
+            f"PLAN STAGNATION — the count of untouched plan steps "
+            f"({len(untouched)}) has NOT decreased for "
+            f"{plan_stagnation_rounds} consecutive reflect rounds. The "
+            "investigation is producing facts but not completing the "
+            "originally planned scope. Your NEXT `next_steps` MUST "
+            "either (a) dispatch one or more of the untouched plan "
+            "steps listed above, OR (b) cite the specific KNOWN_FACT "
+            "that invalidates each remaining untouched step. Continuing "
+            "to fan out new probes outside the plan without making "
+            "progress on the planned scope is not allowed."
         )
 
     sections.append(
@@ -808,6 +896,16 @@ def create_per_agent(opensearch_url: str) -> Agent:
             model_id=_DEFAULT_BEDROCK_MODEL_ID,
         )
 
+    if not os.getenv("BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN"):
+        os.environ["BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN"] = _DEFAULT_EXECUTOR_BEDROCK_MODEL_ID
+        log_info_event(
+            logger,
+            f"BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN not set, defaulting to "
+            f"{_DEFAULT_EXECUTOR_BEDROCK_MODEL_ID}",
+            "per_agent.default_executor_model",
+            model_id=_DEFAULT_EXECUTOR_BEDROCK_MODEL_ID,
+        )
+
     log_info_event(
         logger,
         f"Initializing PER agent with OpenSearch at {opensearch_url}",
@@ -866,7 +964,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
         plan_result, _, _, _ = await _run_phase(
             plan_agent, problem_statement, "plan", step_index=0
         )
-        plan_steps, plan_final = _parse_planner_output(str(plan_result))
+        plan_steps, plan_final = _planner_decision_from_result(plan_result)
 
         if plan_final:
             # Planner answered directly without needing execution.
@@ -902,6 +1000,27 @@ def create_per_agent(opensearch_url: str) -> Agent:
         pending_steps: list[str] = [plan_steps[0]]
         last_reflect_text = ""
         steps_executed = 0
+        # Convergence tracking: counts the cumulative number of high-grade
+        # facts ([direct] or [deviation]) recorded so far. Each reflect
+        # round compares the current count against this snapshot — if no
+        # new high-grade evidence has arrived for `_STAGNATION_ROUNDS_FORCE`
+        # consecutive rounds we treat the investigation as having
+        # converged on whatever it has now and switch to the force-
+        # finalize prompt. This is more discriminating than a fixed step
+        # threshold: investigations that keep producing evidence are
+        # allowed to run longer; investigations that don't are stopped
+        # earlier. Tracks `[symptom]` and `[schema]` separately is NOT
+        # done because those tags don't change the conclusion (symptoms
+        # are unresolved hypotheses, schema discoveries are operational).
+        last_high_grade_count = 0
+        stagnant_rounds = 0
+        # Plan-stagnation tracking: count consecutive reflect rounds in
+        # which the number of untouched original plan steps did not
+        # decrease. Independent from `stagnant_rounds`: the reflector can
+        # be advancing on high-grade evidence (no stagnation) while still
+        # ignoring the original plan entirely (plan stagnation).
+        last_untouched_plan_count: int | None = None
+        plan_stagnant_rounds = 0
 
         while pending_steps and steps_executed < _MAX_STEPS:
             batch = pending_steps[: max(1, _MAX_STEPS - steps_executed)]
@@ -962,15 +1081,84 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 batch_elapsed_ms=batch_elapsed_ms,
             )
 
+            # Convergence check: did this batch produce any new [direct]
+            # or [deviation] fact? If not, increment the stagnation
+            # counter; if it did, reset. The stagnation counter is the
+            # primary trigger for force-finalize — see comment at the
+            # top of the loop.
+            current_high_grade_count = sum(
+                1
+                for art in artifacts
+                for fact in art.facts
+                if fact.lstrip().lower().startswith(("[direct]", "[deviation]"))
+            )
+            new_evidence = current_high_grade_count - last_high_grade_count
+            # Stagnation is only meaningful AFTER the investigation has
+            # produced at least one [direct] or [deviation] fact. Schema
+            # discovery / signal-family inventory phases produce only
+            # [schema] facts by design, and a strict "no high-grade for
+            # 2 rounds" rule would force-finalize before any per-entity
+            # comparison runs. Hold the counter at 0 until the first
+            # high-grade fact lands, then start monitoring stagnation.
+            if current_high_grade_count == 0:
+                stagnant_rounds = 0
+                phase = "discovery"
+            elif new_evidence > 0:
+                stagnant_rounds = 0
+                phase = "advancing"
+            else:
+                stagnant_rounds += 1
+                phase = "stagnant"
+            last_high_grade_count = current_high_grade_count
+
+            # Plan-stagnation: did the count of untouched original plan
+            # steps shrink this round? Done after stagnation update so a
+            # round can be both 'advancing' (new high-grade) and
+            # plan-stagnant (didn't reduce untouched plan count). Skip
+            # entirely if the original plan was empty.
+            current_untouched = len(_untouched_plan_steps(plan_steps, artifacts)) if plan_steps else 0
+            if not plan_steps:
+                plan_stagnant_rounds = 0
+            elif last_untouched_plan_count is None:
+                plan_stagnant_rounds = 0
+            elif current_untouched < last_untouched_plan_count:
+                plan_stagnant_rounds = 0
+            else:
+                plan_stagnant_rounds += 1
+            last_untouched_plan_count = current_untouched
+
+            log_info_event(
+                logger,
+                f"[per] convergence: phase={phase} new={new_evidence} "
+                f"stagnant_rounds={stagnant_rounds} "
+                f"high_grade_total={current_high_grade_count} "
+                f"untouched_plan={current_untouched} "
+                f"plan_stagnant_rounds={plan_stagnant_rounds}",
+                "per.pipeline.convergence",
+                steps_executed=steps_executed,
+                phase=phase,
+                new_high_grade=new_evidence,
+                stagnant_rounds=stagnant_rounds,
+                high_grade_total=current_high_grade_count,
+                untouched_plan_count=current_untouched,
+                plan_stagnant_rounds=plan_stagnant_rounds,
+            )
+
             reflect_agent = build_reflect_agent()
-            force_finalize = steps_executed >= _FORCE_FINALIZE_STEPS
+            stagnant_force = stagnant_rounds >= _STAGNATION_ROUNDS_FORCE
+            step_force = steps_executed >= _FORCE_FINALIZE_STEPS
+            force_finalize = stagnant_force or step_force
             if force_finalize:
                 log_warning_event(
                     logger,
-                    f"[per] force-finalize triggered at step {steps_executed}",
+                    f"[per] force-finalize triggered at step {steps_executed} "
+                    f"(stagnant={stagnant_force}, step_cap={step_force})",
                     "per.pipeline.force_finalize",
                     steps_executed=steps_executed,
-                    threshold=_FORCE_FINALIZE_STEPS,
+                    stagnant_rounds=stagnant_rounds,
+                    stagnation_threshold=_STAGNATION_ROUNDS_FORCE,
+                    step_threshold=_FORCE_FINALIZE_STEPS,
+                    triggered_by="stagnation" if stagnant_force else "step_cap",
                 )
                 reflect_prompt = _build_force_finalize_input(
                     objective=problem_statement,
@@ -987,12 +1175,13 @@ def create_per_agent(opensearch_url: str) -> Agent:
                     plan_steps=plan_steps,
                     artifacts=artifacts,
                     latest_n=batch_size,
+                    plan_stagnation_rounds=plan_stagnant_rounds,
                 )
             reflect_result, _, _, _ = await _run_phase(
                 reflect_agent, reflect_prompt, "reflect", steps_executed
             )
             last_reflect_text = str(reflect_result)
-            decision = _parse_reflect_output(last_reflect_text)
+            decision = _reflect_decision_from_result(reflect_result)
 
             # Under force-finalize, whatever the model returns is
             # accepted as the final report — gates are suspended and

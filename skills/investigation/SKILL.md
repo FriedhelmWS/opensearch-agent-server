@@ -100,6 +100,20 @@ Every numeric metric is one of:
 
 Mixing these up is the most common quantitative error in metric analysis. A "huge counter value" tells you nothing; a counter that didn't change between two samples has rate zero regardless of magnitude.
 
+**Recognising a counter vs gauge before you query.** During Phase A schema discovery, classify each numeric field BEFORE you write the Phase B query. Use these heuristics, in order:
+
+1. **Naming convention.** Prometheus and many cgroup exporters end counters with `-total` (e.g., `*-seconds-total`, `*-bytes-total`, `*-failures-total`). These are almost always cumulative counters. Gauges typically end in nouns describing the current state (`*-bytes`, `*-set-bytes`, `*-rss`, `*-cache`, `-current`, queue lengths).
+2. **Sampling pattern.** Pull two consecutive sample values for the field (Phase A.1 already samples one document; sample one more from the next timestamp). If the value is monotonically non-decreasing, it is a counter. If it fluctuates around a mean, it is a gauge — even if its name ends in `-total` (some exporters emit pre-rated samples).
+3. **Magnitude.** "An instantaneous CPU reading of 17.78 seconds with a 1-second scrape interval is impossible" — that magnitude only makes sense as elapsed CPU-time, i.e. a counter. If the absolute value is much larger than what an instant reading should be, treat as counter.
+
+**Common saturation traps that follow.** Once you have classified the fields, the wrong direct comparison gives nonsense:
+
+- **CPU usage (counter) vs CPU quota (constant)**: dividing the average of `*-cpu-usage-seconds-total` by the average of `*-spec-cpu-quota` yields saturation values of hundreds or thousands of percent — wrong by orders of magnitude. Compute `rate = (max - min) / window_seconds`, then `saturation = rate / (quota_us / 100_000)` for cgroup v1 quotas in microseconds-per-100ms.
+- **Memory usage (gauge) vs memory limit (constant)**: this division IS valid. `avg(working-set-bytes) / avg(spec-memory-limit-bytes)` is a real saturation ratio.
+- **Disk / IO counters (`*-fs-reads-bytes-total`, `*-fs-writes-bytes-total`, `*-blkio-device-usage-total`)**: counters. To detect a write storm, compute the rate over the window, not the absolute total. A storm shows as a rate that is ≥ several × baseline rate, not as a large absolute value.
+
+The PPL idioms for computing rate and saturation correctly — and the indices in this ecosystem where `istio-*-total` is unusually pre-rated rather than cumulative — are documented in the `ppl-cookbook` skill (section "Counters vs gauges"). Consult it when about to write a saturation-pair query.
+
 #### B.2 — Rank by relative deviation, not absolute magnitude
 
 Compare each metric in the anomaly window to its baseline. Rank candidates by **how much they deviated from their own normal**, not by absolute value.

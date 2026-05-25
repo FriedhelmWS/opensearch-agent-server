@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 
 import boto3
+from pydantic import BaseModel, Field
 from strands import Agent, AgentSkills, Skill
 from strands.models.bedrock import BedrockModel
 from strands.models.model import CacheConfig
@@ -111,6 +112,114 @@ def set_mcp_client(mcp_client: MCPClient) -> None:
         f"[per] MCP tools resolved for sub-agents ({len(_mcp_tools)} tools)",
         "per.mcp_tools_resolved",
         tool_count=len(_mcp_tools),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structured output schemas. The planner and reflector return their decisions
+# via Strands' ``structured_output_model`` mechanism, which registers a
+# Pydantic-derived tool with Bedrock and forces the model to emit a
+# schema-conformant tool call (no free-form JSON-in-text to regex out).
+# Field semantics are kept verbatim from the prior JSON-schema prose so the
+# critical-rule checks downstream (``_finalize_gate_violations`` etc.) keep
+# working unchanged.
+# ---------------------------------------------------------------------------
+
+
+class PlanOutput(BaseModel):
+    """Structured planner decision.
+
+    Exactly one of ``steps`` / ``result`` is populated each turn:
+    ``steps`` lists the next atomic tasks to dispatch (empty when finished);
+    ``result`` is the final answer (empty until the investigation finishes).
+    """
+
+    steps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ordered list of atomic, self-contained steps to execute. Each "
+            "step states what to do, where, and which tool/parameters to use. "
+            "Leave empty if you can answer in `result` directly without "
+            "further execution."
+        ),
+    )
+    result: str = Field(
+        default="",
+        description=(
+            "Final answer to the objective. Leave empty if more steps are "
+            "needed; populate only when the objective can be answered now."
+        ),
+    )
+
+
+class ReflectOutput(BaseModel):
+    """Structured reflector decision.
+
+    Either ``next_steps`` (more probes) OR ``result`` (final report) is
+    non-empty per turn. The remaining audit-trail fields are populated
+    every turn so the orchestrator's finalize gate can verify them.
+    """
+
+    leading_candidate: str = Field(
+        default="",
+        description=(
+            "The single entity most likely to be the cause given current "
+            "evidence. Empty string only if there is genuinely no candidate "
+            "yet — never empty once any per-entity deviation has been "
+            "observed."
+        ),
+    )
+    candidate_reason: str = Field(
+        default="",
+        description=(
+            "One terse sentence citing a RANKING CRITERION grounded in "
+            "evidence. The criterion MUST express a RELATIVE comparison "
+            "(the entity against its own normal / a comparable baseline) "
+            "— absolute-magnitude criteria are invalid. Cite skill-defined "
+            "ranking criteria when one is active."
+        ),
+    )
+    outlier_candidate: str = Field(
+        default="",
+        description=(
+            "A SECOND distinct entity with a strong relative deviation. "
+            "Prevents confirmation-bias collapse onto the leading candidate. "
+            "Empty only if no second entity shows any abnormal deviation."
+        ),
+    )
+    outlier_reason: str = Field(
+        default="",
+        description="Same audit-trail discipline as candidate_reason.",
+    )
+    direct_indicators_outstanding: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Named direct indicators that, if checked, would confirm or rule "
+            "out the leading candidate. Empty only if every plausible direct "
+            "indicator has been queried already (visible in QUERIES_EXECUTED)."
+        ),
+    )
+    parked_symptoms_outstanding: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every [symptom] fact in KNOWN_FACTS that has not yet been "
+            "promoted to [direct]/[deviation] or explicitly invalidated. "
+            "Empty only if every recorded symptom is resolved."
+        ),
+    )
+    next_steps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Next step(s) to execute. Empty when finalizing with `result`. "
+            "Multi-element only when the steps are FULLY INDEPENDENT (no "
+            "step consumes another's output / discoveries)."
+        ),
+    )
+    result: str = Field(
+        default="",
+        description=(
+            "Final comprehensive report. Empty when more steps are needed."
+        ),
     )
 
 
@@ -207,6 +316,9 @@ Activate domain skills before recording facts:
 Magnitude-bias guard:
 - When you record a numeric measurement, also record (or queue a follow-up query for) a comparable reference value, and emit a `[deviation]` fact once both are in hand. Until the reference lands, a measurement is at best `[symptom]`. A number is only anomalous in proportion to its own normal — never in proportion to other entities' numbers.
 
+Query-format learnings:
+- When a query fails because of a syntax / format / referencing constraint (e.g., an index-name form is rejected, a quoting style doesn't parse, an aggregation can't be applied to a particular field type, a function name differs from what you expected), and you discover a workaround that succeeds, record BOTH the constraint AND the workaround as `[schema]` facts. Format like `[schema] <constraint>; use <workaround> instead`. This is what prevents sibling executors in the same parallel batch — and downstream steps — from rediscovering the same failure mode. A query format that ONE executor learned through trial-and-error is invisible to the others unless it lands in KNOWN_FACTS.
+
 Format exactly:
 
 QUERIES_EXECUTED:
@@ -223,58 +335,28 @@ Both sections are REQUIRED on every response. If a section has nothing to record
 
 PLAN_EXECUTE_REFLECT_RESPONSE_FORMAT = """\
 Response Instructions:
-Only respond in JSON format. Always follow the given response instructions. Do not return any content that does not follow the response instructions. Do not add anything before or after the expected JSON.
-Always respond with a valid JSON object that strictly follows the below schema:
-{
-\t"steps": array[string],
-\t"result": string
-}
-Use "steps" to return an array of strings where each string is a step to complete the objective, leave it empty if you know the final result. Please wrap each step in quotes and escape any special characters within the string.
-Use "result" return the final response when you have enough information, leave it empty if you want to execute more steps. Please escape any special characters within the result.
-Here are examples of valid responses following the required JSON schema:
+Return your decision by calling the structured-output tool exposed to you. The tool's schema mirrors `PlanOutput` — populate `steps` (array of step strings) when more execution is needed, OR populate `result` (final answer string) when you can answer the objective now. Exactly one of the two must be non-empty.
 
-Example 1 - When you need to execute steps:
-{
-\t"steps": ["This is an example step", "this is another example step"],
-\t"result": ""
-}
-
-Example 2 - When you have the final result:
-{
-\t"steps": [],
-\t"result": "This is an example result\\n with escaped special characters"
-}
 Important rules for the response:
-1. Do not use commas within individual steps
-2. Do not add any content before or after the JSON
-3. Only respond with a pure JSON object
+1. Do not use commas within individual steps (commas tend to be misread as additional list elements by downstream consumers).
+2. Do not produce free-form text outside of the structured-output tool call.
+3. Each `steps` entry is one atomic, self-contained task — do NOT compress multiple distinct tasks into one entry separated by "and".
 
 """
 
 REFLECT_RESPONSE_FORMAT = """\
 Response Instructions:
-Only respond in JSON format. Always follow the given response instructions. Do not return any content that does not follow the response instructions. Do not add anything before or after the expected JSON.
-Always respond with a valid JSON object that strictly follows the below schema:
-{
-\t"leading_candidate": string,
-\t"candidate_reason": string,
-\t"outlier_candidate": string,
-\t"outlier_reason": string,
-\t"direct_indicators_outstanding": array[string],
-\t"parked_symptoms_outstanding": array[string],
-\t"next_steps": array[string],
-\t"result": string
-}
+Return your decision by calling the structured-output tool exposed to you. The tool's schema mirrors `ReflectOutput` and the field semantics below are normative — populate every field every turn so the orchestrator can audit the decision against the finalize gate. Either `next_steps` (more probes) OR `result` (final report) is non-empty per turn — never both.
 
-Field semantics:
-- "leading_candidate": the single entity (whatever the task is about — component, service, resource, file, document, query, etc.) most likely to be the cause of the observed problem, given current evidence. Empty string ("") only if there is genuinely no candidate yet. NEVER empty once any per-entity deviation has been observed.
-- "candidate_reason": one terse sentence citing a RANKING CRITERION grounded in evidence. The criterion MUST express a RELATIVE comparison (the entity against its own normal / a comparable baseline) — absolute-magnitude criteria like "highest value in the cluster" are invalid because they fall to magnitude bias. If a domain skill defines named ranking criteria, cite them.
-- "outlier_candidate": a SECOND distinct entity that shows a strong relative deviation but is not (or not yet) the leading candidate. This slot exists to prevent confirmation-bias collapse onto the leading candidate. Even with high confidence in `leading_candidate`, name the next-most-anomalous entity here. Empty string ("") only if no second entity shows any abnormal deviation.
-- "outlier_reason": one terse sentence with the same audit-trail discipline as candidate_reason.
-- "direct_indicators_outstanding": list of named direct indicators that, if checked, would confirm or rule out the leading candidate. The set of indicators that count as "direct" for a given task is defined by the relevant domain skill; if a skill is active, use its taxonomy. If no skill applies, derive indicators from first principles (signals whose presence would unambiguously imply the candidate's hypothesis). Empty array ([]) only if every plausible direct indicator has been queried already (visible in QUERIES_EXECUTED).
-- "parked_symptoms_outstanding": every `[symptom]` fact in KNOWN_FACTS that has NOT yet been either (a) explicitly promoted to a `[direct]` or `[deviation]` fact, or (b) explicitly invalidated by another fact. List them as terse bullets so they are not forgotten. Empty array ([]) only if every recorded symptom has been resolved.
-- "next_steps": the next step(s) to execute. Leave it empty array ([]) if you have enough information to produce the final result.
-- "result": the final comprehensive report when you have enough information. Leave it empty string ("") if you want the executor to run "next_steps".
+Field semantics (apply to the structured-output tool's parameters):
+- `leading_candidate`: the single entity (whatever the task is about — component, service, resource, file, document, query, etc.) most likely to be the cause of the observed problem, given current evidence. Empty string only if there is genuinely no candidate yet. NEVER empty once any per-entity deviation has been observed.
+- `candidate_reason`: one terse sentence citing a RANKING CRITERION grounded in evidence. The criterion MUST express a RELATIVE comparison (the entity against its own normal / a comparable baseline) — absolute-magnitude criteria like "highest value in the cluster" are invalid because they fall to magnitude bias. If a domain skill defines named ranking criteria, cite them.
+- `outlier_candidate`: a SECOND distinct entity that shows a strong relative deviation but is not (or not yet) the leading candidate. This slot exists to prevent confirmation-bias collapse onto the leading candidate. Even with high confidence in `leading_candidate`, name the next-most-anomalous entity here. Empty string only if no second entity shows any abnormal deviation.
+- `outlier_reason`: one terse sentence with the same audit-trail discipline as candidate_reason.
+- `direct_indicators_outstanding`: list of named direct indicators that, if checked, would confirm or rule out the leading candidate. The set of indicators that count as "direct" for a given task is defined by the relevant domain skill; if a skill is active, use its taxonomy. If no skill applies, derive indicators from first principles (signals whose presence would unambiguously imply the candidate's hypothesis). Empty list only if every plausible direct indicator has been queried already (visible in QUERIES_EXECUTED).
+- `parked_symptoms_outstanding`: every `[symptom]` fact in KNOWN_FACTS that has NOT yet been either (a) explicitly promoted to a `[direct]` or `[deviation]` fact, or (b) explicitly invalidated by another fact. List them as terse bullets so they are not forgotten. Empty list only if every recorded symptom has been resolved.
+- `next_steps`: the next step(s) to execute. Empty list if you have enough information to produce the final result.
+- `result`: the final comprehensive report when you have enough information. Empty string if you want the executor to run `next_steps`.
 
 Parallelism rules — when to put MULTIPLE steps in `next_steps`:
 - Put two or more steps in `next_steps` ONLY if they are FULLY INDEPENDENT: none consumes the output of another, none reads a field whose existence/units another is meant to discover, and none narrows a service/index that another is meant to enumerate.
@@ -308,49 +390,10 @@ Critical rules:
    APPARENT IMPROVEMENT IS NOT NEUTRAL: a measurement going down, a counter going to zero, or a signal disappearing is itself a signal — it may indicate stall, silent failure, throttling, or measurement loss rather than recovery. When the leading_candidate "looks better" in a family, that does not by itself rule it out — the family must have been actively probed (with a comparable reference) before the improvement is treated as exoneration.
 14. Finalize with `result` only when rules 5–13 are ALL satisfied AND the cumulative evidence answers the objective. Premature finalization on a partial picture is the single most common failure mode of this pipeline — actively guard against it.
 
-Example - one more step needed:
-{
-\t"leading_candidate": "<entity or empty string if none yet>",
-\t"candidate_reason": "<terse sentence citing a RELATIVE-deviation criterion>",
-\t"outlier_candidate": "<a second entity with a strong relative deviation, or empty if none>",
-\t"outlier_reason": "<terse sentence citing the relative deviation that placed it here>",
-\t"direct_indicators_outstanding": ["<indicator name that still needs querying>"],
-\t"parked_symptoms_outstanding": ["<symptom not yet resolved>"],
-\t"next_steps": ["<single concrete step: what to do, where, with which tool/parameters>"],
-\t"result": ""
-}
-
-Example - several independent investigations can run together:
-{
-\t"leading_candidate": "<entity or empty>",
-\t"candidate_reason": "<relative-deviation reason>",
-\t"outlier_candidate": "<second entity or empty>",
-\t"outlier_reason": "<relative-deviation reason>",
-\t"direct_indicators_outstanding": ["<indicator 1>", "<indicator 2>", "<indicator 3>"],
-\t"parked_symptoms_outstanding": ["<symptom 1>"],
-\t"next_steps": [
-\t\t"<step A targeting one independent data source>",
-\t\t"<step B targeting a different independent data source>",
-\t\t"<step C targeting a third independent data source>"
-\t],
-\t"result": ""
-}
-
-Example - have the answer:
-{
-\t"leading_candidate": "<final cause entity>",
-\t"candidate_reason": "<criterion + causal-walk outcome>",
-\t"outlier_candidate": "<second-highest relative deviation, or empty if all others ruled out>",
-\t"outlier_reason": "<accounting for the second entity>",
-\t"direct_indicators_outstanding": [],
-\t"parked_symptoms_outstanding": [],
-\t"next_steps": [],
-\t"result": "<comprehensive final report with escaped special characters>"
-}
-
 Important rules for the response:
-1. Do not add any content before or after the JSON
-2. Only respond with a pure JSON object
+1. Call the structured-output tool with all fields populated per the field semantics above.
+2. Do not produce free-form text outside of the structured-output tool call.
+3. The `result` field is the deliverable for the user when the investigation finishes — write it as a comprehensive markdown report (lists, headings, code blocks fine; just escape backslashes and quotes as JSON requires).
 
 """
 
@@ -415,7 +458,7 @@ EXECUTOR_SYSTEM_PROMPT = (
 _MAX_OUTPUT_TOKENS = 32768
 
 
-def _model(*, cache_tools: bool = False) -> BedrockModel:
+def _model(*, cache_tools: bool = False, model_id_env: str | None = None) -> BedrockModel:
     # Prompt-caching strategy:
     #   - For the executor: ``cache_tools="default"`` injects a cache point
     #     at the end of the tool schema block. Bedrock caches the prefix up
@@ -433,8 +476,19 @@ def _model(*, cache_tools: bool = False) -> BedrockModel:
     # ``max_tokens`` is raised well above the Bedrock default because
     # executor responses can include raw tool outputs (full document
     # samples, large aggregation results) that the planner needs verbatim.
+    #
+    # ``model_id_env`` selects which env var to read the model id from,
+    # so the executor can run on a faster / cheaper model than the
+    # planner / reflector. Falls back to ``BEDROCK_INFERENCE_PROFILE_ARN``
+    # when the executor-specific override is unset, so deployments that
+    # don't care about the split keep working unchanged.
+    model_id = None
+    if model_id_env:
+        model_id = os.getenv(model_id_env)
+    if not model_id:
+        model_id = os.getenv("BEDROCK_INFERENCE_PROFILE_ARN")
     kwargs: dict = {
-        "model_id": os.getenv("BEDROCK_INFERENCE_PROFILE_ARN"),
+        "model_id": model_id,
         "boto_session": bedrock_session,
         "streaming": True,
         "max_tokens": _MAX_OUTPUT_TOKENS,
@@ -450,6 +504,7 @@ def build_plan_agent() -> Agent:
         model=_model(),
         system_prompt=PLANNER_SYSTEM_PROMPT,
         plugins=_skills_plugin(),
+        structured_output_model=PlanOutput,
         name="per_plan_agent",
     )
 
@@ -460,8 +515,14 @@ def build_execute_agent() -> Agent:
             "MCP tools not configured. Call set_mcp_client() before "
             "build_execute_agent()."
         )
+    # Executor runs the high-volume mechanical work (issue PPL queries,
+    # transcribe results into KNOWN_FACTS, follow the executor system-
+    # prompt structure). It does not need the heavier reasoning model
+    # the planner / reflector use, so it reads from a separate env var
+    # (``BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN``) that defaults back to
+    # ``BEDROCK_INFERENCE_PROFILE_ARN`` when unset.
     return Agent(
-        model=_model(cache_tools=True),
+        model=_model(cache_tools=True, model_id_env="BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN"),
         system_prompt=EXECUTOR_SYSTEM_PROMPT,
         tools=list(_mcp_tools),
         plugins=_skills_plugin(),
@@ -474,5 +535,6 @@ def build_reflect_agent() -> Agent:
         model=_model(),
         system_prompt=REFLECT_SYSTEM_PROMPT,
         plugins=_skills_plugin(),
+        structured_output_model=ReflectOutput,
         name="per_reflect_agent",
     )
