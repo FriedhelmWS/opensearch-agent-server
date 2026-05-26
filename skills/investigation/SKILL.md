@@ -203,16 +203,15 @@ If your investigation only considers the modes from a familiar checklist, you wi
 
 For each candidate mode, ask: **what evidence, if present, would directly imply this mode (not merely be consistent with it)?**
 
-Direct indicators take a small number of structural shapes. Use these as a checklist when constructing the indicator queries:
+Direct indicators take a small number of structural shapes:
 
 - **Resource saturation against a limit** (usage / limit at high percentage in the anomaly window). Requires identifying the limit.
 - **A monotonic resource counter (count of in-use items) at an anomalous level** — counts of in-flight things, not rates.
-- **A specific log class** — a message that names the failure mode unambiguously, distinct from generic error/exception text.
-- **A structural signature in trace shape** — e.g., a span whose duration is dominated by self-time with no compute activity (characteristic of waiting on the network); a leaf span much slower than baseline with no resource pressure on either endpoint.
+- **A structural signature in trace shape** — e.g., a span whose duration is dominated by self-time with no compute activity (characteristic of waiting on the network); a leaf span much slower than baseline with no resource pressure on either endpoint; a downstream call's parent-side D much greater than the callee-side D′ (network or queue time on the path).
 - **A causal-state transition** — restart, crash, leadership change, reconfiguration event recorded somewhere.
 - **A counter rate that collapses or reverses across two anomaly samples** — implies stall or restart, not "recovery".
 
-For each candidate mode, write down (or query for) at least one such direct indicator. **A candidate with no direct indicator cannot be named as the mode.** It can only be reported as "not ruled in".
+For each candidate mode, write down (or query for) at least one such direct indicator. **A candidate with no direct indicator cannot be named as the mode.** It can only be reported as "not ruled in". The reverse also holds: **the absence of a non-specific signal does not falsify a mode.** A keyword's non-appearance in a log corpus rules out that exact keyword, not the underlying mode — many degradations produce no distinctive log line at all.
 
 #### C.4 — Causal precedence when multiple modes show signals
 
@@ -274,7 +273,7 @@ The misclassifications in past failed runs cluster under a small set of cognitiv
 - NEVER name a mode without at least one direct indicator (C.3); honestly report "no direct evidence" instead of defaulting to the most familiar category.
 - NEVER attribute network-path latency to the caller when caller D ≫ callee D′; the loss is on the path TO the callee.
 - NEVER name the component mentioned in an error message as the root cause; the originator is the component whose spans / metrics show the anomalous pattern.
-- NEVER skip the log sweep / direct-indicator check for any candidate; "no signal found" is the explicit output, not silence.
+- NEVER treat the absence of a generic-keyword match in logs as falsification of a candidate mode; absence of a non-specific signal proves nothing about the mode.
 - NEVER conclude "no errors" from a single error-field query; error fields vary across instrumentations on the same system.
 - NEVER let the final hypothesis disagree with the top-ranked candidate from Phase B. If they conflict, redo B.7 — the candidate ranking is authoritative.
 - NEVER use familiarity ("this looks like a CPU problem") as a substitute for direct evidence.

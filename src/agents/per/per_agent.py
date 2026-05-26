@@ -65,16 +65,11 @@ from utils.obo_context import OboAuth
 
 logger = get_logger(__name__)
 
+# Default model for both planner/reflector AND executor when their env
+# vars are unset. Override per-deployment via ``BEDROCK_INFERENCE_PROFILE_ARN``
+# (planner/reflector) and ``BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN`` (executor);
+# typical config sets the former to Opus and the latter to Sonnet 4.6.
 _DEFAULT_BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
-
-# Default model for the executor sub-agent. Executor work (issue queries,
-# transcribe results into KNOWN_FACTS) is mechanical and does not benefit
-# from the heavier reasoning model the planner / reflector use, so we
-# default it to the same Sonnet ID as the orchestrator fallback. Override
-# per-deployment by setting ``BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN`` to
-# any inference-profile ARN in the environment — Sonnet 4.6 is a typical
-# choice when ``BEDROCK_INFERENCE_PROFILE_ARN`` points at Opus.
-_DEFAULT_EXECUTOR_BEDROCK_MODEL_ID = _DEFAULT_BEDROCK_MODEL_ID
 
 # Mirrors DEFAULT_MAX_STEPS_EXECUTED in MLPlanExecuteAndReflectAgentRunner.java.
 _MAX_STEPS = 20
@@ -102,15 +97,27 @@ _FORCE_FINALIZE_STEPS = 12
 # stops arriving, further probing is unlikely to change the conclusion.
 _STAGNATION_ROUNDS_FORCE = 2
 
-# Number of consecutive reflect rounds during which the count of
-# untouched original plan steps does NOT decrease, after which the
-# reflect prompt gets a PLAN STAGNATION nudge. Captures the failure
-# mode where the reflector keeps producing high-grade facts (so
-# stagnation doesn't fire) but does so by exploring side-paths that
-# bypass the original plan entirely — its candidate set drifts off the
-# investigation's intended scope. Detection is deterministic: it reuses
-# the existing ``_untouched_plan_steps`` token-coverage check.
-_PLAN_STAGNATION_ROUNDS_NUDGE = 3
+# Wall-clock budget for an entire PER pipeline run, in seconds. Once
+# the elapsed time crosses this, the NEXT reflect phase switches to
+# force-finalize regardless of step count or convergence state. This
+# is the hard guarantee that pipeline runs cannot drag past ~12
+# minutes — independent of how cheaply or expensively each step
+# happens to behave on a given run. Force-finalize itself adds another
+# 30-60s for the final reflect, plus output streaming, so the
+# end-to-end ceiling is roughly budget + ~120s.
+_PIPELINE_WALL_CLOCK_BUDGET_SECONDS = 720
+
+# Maximum number of executor sub-agents we will run concurrently in a single
+# fan-out batch. The reflector is allowed to declare more independent steps
+# than this — we just slice them across multiple loop iterations. Three is
+# the sweet spot for OTel-style triple-source investigations (logs + traces
+# + metrics) where all three are commonly independent at the same step.
+# Going higher (4+) reproduces the context-overflow retry storm we hit
+# previously: each executor inherits the full ArtifactStore-derived
+# KNOWN_FACTS block plus its own multi-tool-call conversation history, and
+# 4+ of those in flight push Bedrock's accumulated payload past the model's
+# context window.
+_MAX_PARALLEL_EXECUTORS = 3
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are an investigation orchestrator. Your role
 is to dispatch the user's investigation question to the plan→execute→
@@ -139,63 +146,18 @@ well so the user can see what happened.
 """
 
 
-def _extract_json_blob(text: str) -> dict | None:
-    """Best-effort extraction of the last JSON object in a string.
-
-    Mirrors ``extractJsonFromMarkdown`` in the Java runner: tolerates
-    ```json fences and unwrapped JSON, and falls back to substring between
-    the first ``{`` and the last ``}``.
-    """
-    if not text:
-        return None
-    fence_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence_match:
-        try:
-            return json.loads(fence_match.group(1))
-        except json.JSONDecodeError:
-            pass
-    matches = list(re.finditer(r"\{.*\}", text, re.DOTALL))
-    for match in reversed(matches):
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            continue
-    return None
-
-
-def _parse_planner_output(text: str) -> tuple[list[str], str]:
-    """Legacy fallback: regex-extract a JSON blob from raw planner text.
-
-    Used only if the structured-output tool call did NOT land (network
-    blip, model went off-protocol, etc.). Normal path is
-    :func:`_planner_decision_from_result` which reads the validated
-    Pydantic instance off the AgentResult.
-    """
-    parsed = _extract_json_blob(text)
-    if not parsed:
-        return [], ""
-    steps_raw = parsed.get("steps") or []
-    steps = [str(s) for s in steps_raw if isinstance(s, str)]
-    result = parsed.get("result")
-    result = result.strip() if isinstance(result, str) else ""
-    return steps, result
-
-
 def _planner_decision_from_result(result) -> tuple[list[str], str]:
     """Read planner decision off an AgentResult.
 
     Strands' ``structured_output_model`` parameter forces the model to
     invoke a generated tool whose input matches :class:`PlanOutput`; the
-    validated instance is exposed at ``result.structured_output``. We
-    prefer that path because the schema is enforced server-side; if it's
-    missing (extremely rare — model went off-protocol despite forcing),
-    fall back to the legacy regex extractor on the raw text.
+    validated instance is exposed at ``result.structured_output``.
     """
     so = getattr(result, "structured_output", None)
     if isinstance(so, PlanOutput):
         steps = [s.strip() for s in so.steps if isinstance(s, str) and s.strip()]
         return steps, (so.result or "").strip()
-    return _parse_planner_output(str(result))
+    return [], ""
 
 
 @dataclass
@@ -208,96 +170,42 @@ class ReflectDecision:
     candidate_reason: str = ""
     outlier_candidate: str = ""
     outlier_reason: str = ""
-    direct_indicators_outstanding: list[str] = field(default_factory=list)
-    parked_symptoms_outstanding: list[str] = field(default_factory=list)
+    outstanding_probes: list[str] = field(default_factory=list)
+    proposed_mechanism: str = ""
+    mechanism_alternatives: list[str] = field(default_factory=list)
+    mechanism_evidence: list[str] = field(default_factory=list)
+    dimensions_invalidated: list[str] = field(default_factory=list)
 
 
 def _reflect_decision_from_result(result) -> ReflectDecision:
     """Read reflector decision off an AgentResult.
 
-    Same contract as :func:`_planner_decision_from_result`: prefer the
-    validated Pydantic instance (:class:`ReflectOutput`) attached by
-    Strands' structured-output mechanism, fall back to the legacy regex
-    parser only when the tool call somehow did not happen.
+    Strands' ``structured_output_model`` mechanism delivers a validated
+    :class:`ReflectOutput` instance at ``result.structured_output``. If
+    the structured-output tool somehow didn't land we surface an empty
+    decision; ``ReflectOutput``'s field validators already coerce most
+    sloppy model inputs (None / scalar where list expected) so this
+    fallback path is rare.
     """
     so = getattr(result, "structured_output", None)
-    if isinstance(so, ReflectOutput):
-        return ReflectDecision(
-            next_steps=[s.strip() for s in so.next_steps if isinstance(s, str) and s.strip()],
-            result=(so.result or "").strip(),
-            leading_candidate=(so.leading_candidate or "").strip(),
-            candidate_reason=(so.candidate_reason or "").strip(),
-            outlier_candidate=(so.outlier_candidate or "").strip(),
-            outlier_reason=(so.outlier_reason or "").strip(),
-            direct_indicators_outstanding=[
-                s.strip() for s in so.direct_indicators_outstanding if isinstance(s, str) and s.strip()
-            ],
-            parked_symptoms_outstanding=[
-                s.strip() for s in so.parked_symptoms_outstanding if isinstance(s, str) and s.strip()
-            ],
-        )
-    return _parse_reflect_output(str(result))
-
-
-def _parse_reflect_output(text: str) -> ReflectDecision:
-    """Legacy fallback: regex-extract a JSON blob from raw reflector text.
-
-    The reflect schema is a diff: a list of next steps to dispatch
-    (``len > 1`` means independent and OK to fan out in parallel), or a
-    populated ``result`` to terminate. The schema also exposes the
-    leading candidate, the criterion that placed it there, and the list
-    of direct indicators that still need querying — these are used by
-    the orchestrator to enforce finalize gates without trusting the
-    reflector to self-police.
-
-    Returns an empty ``ReflectDecision`` on unparseable output so the
-    caller can decide to abort. Tolerates a legacy ``next_step``
-    (singular string) field for forward compatibility — earlier reflect
-    prompts emitted that shape.
-    """
-    parsed = _extract_json_blob(text)
-    if not parsed:
+    if not isinstance(so, ReflectOutput):
         return ReflectDecision(next_steps=[], result="")
-    raw_steps = parsed.get("next_steps")
-    steps: list[str] = []
-    if isinstance(raw_steps, list):
-        steps = [s.strip() for s in raw_steps if isinstance(s, str) and s.strip()]
-    elif isinstance(raw_steps, str) and raw_steps.strip():
-        steps = [raw_steps.strip()]
-    else:
-        legacy = parsed.get("next_step")
-        if isinstance(legacy, str) and legacy.strip():
-            steps = [legacy.strip()]
-    result = parsed.get("result")
-    result = result.strip() if isinstance(result, str) else ""
-    leading = parsed.get("leading_candidate")
-    leading = leading.strip() if isinstance(leading, str) else ""
-    reason = parsed.get("candidate_reason")
-    reason = reason.strip() if isinstance(reason, str) else ""
-    outlier = parsed.get("outlier_candidate")
-    outlier = outlier.strip() if isinstance(outlier, str) else ""
-    outlier_reason_raw = parsed.get("outlier_reason")
-    outlier_reason = (
-        outlier_reason_raw.strip() if isinstance(outlier_reason_raw, str) else ""
-    )
 
-    def _str_list(key: str) -> list[str]:
-        raw = parsed.get(key)
-        if isinstance(raw, list):
-            return [s.strip() for s in raw if isinstance(s, str) and s.strip()]
-        return []
+    def _clean_list(values: list) -> list[str]:
+        return [s.strip() for s in values if isinstance(s, str) and s.strip()]
 
-    indicators = _str_list("direct_indicators_outstanding")
-    parked = _str_list("parked_symptoms_outstanding")
     return ReflectDecision(
-        next_steps=steps,
-        result=result,
-        leading_candidate=leading,
-        candidate_reason=reason,
-        outlier_candidate=outlier,
-        outlier_reason=outlier_reason,
-        direct_indicators_outstanding=indicators,
-        parked_symptoms_outstanding=parked,
+        next_steps=_clean_list(so.next_steps),
+        result=(so.result or "").strip(),
+        leading_candidate=(so.leading_candidate or "").strip(),
+        candidate_reason=(so.candidate_reason or "").strip(),
+        outlier_candidate=(so.outlier_candidate or "").strip(),
+        outlier_reason=(so.outlier_reason or "").strip(),
+        outstanding_probes=_clean_list(so.outstanding_probes),
+        proposed_mechanism=(so.proposed_mechanism or "").strip(),
+        mechanism_alternatives=_clean_list(so.mechanism_alternatives),
+        mechanism_evidence=_clean_list(so.mechanism_evidence),
+        dimensions_invalidated=_clean_list(so.dimensions_invalidated),
     )
 
 
@@ -350,95 +258,6 @@ def _extract_sections(findings: str) -> tuple[str, list[str], list[str]]:
     return head, queries, facts
 
 
-def _extract_facts(findings: str) -> tuple[str, list[str]]:
-    """Backwards-compatible shim returning just findings + facts."""
-    head, _queries, facts = _extract_sections(findings)
-    return head, facts
-
-
-_QUOTED_TOKEN_RE = re.compile(r"['\"`]([^'\"`\n]{2,})['\"`]")
-_BARE_IDENT_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_.-]{2,})\b")
-# Generic words that recur in plan steps but don't distinguish what the
-# step is *about*. These would produce false positives if treated as
-# coverage signals (they appear in nearly every step or finding).
-_COVERAGE_STOPWORDS = frozenset(
-    {
-        # articles / pronouns / connectives
-        "the", "and", "for", "with", "from", "into", "this", "that",
-        "these", "those", "their", "each", "all", "any", "some", "such",
-        "than", "then", "between", "before", "after", "across", "based",
-        # generic verbs
-        "use", "using", "used", "run", "running", "execute", "executed",
-        "perform", "performs", "performed", "include", "includes",
-        "compute", "identify", "discover", "confirm", "check", "ensure",
-        "verify", "match", "matches", "matched", "find", "finds",
-        "found", "return", "returns", "returned", "reason", "rank",
-        "compile", "summarize", "summarise", "produce", "generate",
-        "retrieve", "retrieves", "fetch", "fetches", "show", "list",
-        "lists", "inspect", "examine", "analyze", "analyse", "compare",
-        "over", "above", "below",
-        # generic nouns about plan structure / pipeline
-        "step", "steps", "tool", "tools", "plan", "task", "tasks",
-        "objective", "input", "inputs", "output", "outputs", "context",
-        "request", "response", "report", "reports", "summary",
-        "summaries", "conclusion", "final",
-        # generic data-shape nouns
-        "data", "source", "sources", "field", "fields", "document",
-        "documents", "result", "results", "value", "values", "name",
-        "names", "schema", "mapping", "mappings", "structure", "format",
-        "type", "types", "size", "count", "counts", "total", "totals",
-        "service", "services", "entity", "entities", "object", "objects",
-        # generic action / aggregation nouns
-        "query", "queries", "search", "searches", "filter", "filters",
-        "aggregate", "aggregates", "aggregation", "aggregations",
-        "sample", "samples", "buckets", "bucket", "histogram",
-        # generic time / scope nouns
-        "window", "windows", "range", "ranges", "interval", "period",
-        "first", "next", "last", "previous",
-        # generic ordering / superlatives
-        "top", "highest", "lowest", "more", "most", "less", "least",
-        # misc
-        "high", "low", "level", "levels",
-    }
-)
-
-
-def _coverage_tokens(text: str) -> set[str]:
-    """Extract distinguishing tokens from a plan step.
-
-    Returns a lower-cased set of tokens likely to identify what the step
-    is *specifically about* (which index, which field, which metric, etc.).
-    Quoted tokens are always kept (plan steps tend to put concrete
-    identifiers in quotes). Bare identifiers are kept if they aren't in
-    the stopword list and are at least 3 characters — generic English
-    plumbing words are filtered out so that incidental mentions of
-    "search", "index", "tool", etc. don't satisfy coverage.
-
-    Steps consisting entirely of generic action verbs (e.g.
-    ``"Reason over results and rank services"``) yield an empty set, in
-    which case the caller treats the step as un-checkable rather than
-    flagging it.
-    """
-    tokens: set[str] = set()
-    if not text:
-        return tokens
-    for match in _QUOTED_TOKEN_RE.finditer(text):
-        token = match.group(1).strip().lower()
-        if len(token) >= 3:
-            tokens.add(token)
-    for match in _BARE_IDENT_RE.finditer(text):
-        token = match.group(1).strip().lower()
-        if len(token) < 3:
-            continue
-        if token in _COVERAGE_STOPWORDS:
-            continue
-        tokens.add(token)
-    return tokens
-
-
-_PLAN_COVERAGE_THRESHOLD = 0.6
-
-
 def _finalize_gate_violations(
     decision: ReflectDecision, artifacts: ArtifactStore
 ) -> list[str]:
@@ -466,29 +285,26 @@ def _finalize_gate_violations(
             "Per critical rule 9, finalization requires at least one direct "
             "fact for the named candidate; symptom-only attribution is forbidden."
         )
-    if decision.direct_indicators_outstanding:
-        outstanding = ", ".join(decision.direct_indicators_outstanding)
-        violations.append(
-            "direct_indicators_outstanding is non-empty: "
-            f"{outstanding}. Per critical rule 9, query these before finalizing."
-        )
-    # Parked symptoms only block finalization when they touch the leading
-    # candidate. Symptoms about other entities are allowed to remain parked
-    # — the report can mention them as unresolved without blocking. This
-    # prevents the recursive-expansion failure mode where each new probe
-    # surfaces new entities, each of which produces new symptoms.
+    # outstanding_probes carries everything that still blocks finalize:
+    # unqueried direct indicators, unresolved [symptom] facts, unprobed
+    # dimensions. Items mentioning the leading candidate are blocking;
+    # items about unrelated entities are allowed to remain (the report
+    # can call them out as unresolved without forcing more probing —
+    # this prevents the recursive-expansion failure mode where each new
+    # probe surfaces new entities, each of which produces new symptoms).
     candidate_lc = candidate.lower() if candidate else ""
-    blocking_parked = [
-        s for s in decision.parked_symptoms_outstanding
-        if candidate_lc and candidate_lc in s.lower()
+    blocking_probes = [
+        p for p in decision.outstanding_probes
+        if not candidate_lc or candidate_lc in p.lower()
     ]
-    if blocking_parked:
-        parked = "; ".join(blocking_parked)
+    if blocking_probes:
+        probes = "; ".join(blocking_probes)
         violations.append(
-            "parked_symptoms_outstanding contains entries about the leading "
-            f"candidate: {parked}. Per critical rule 12, symptoms about the "
-            "leading candidate must be promoted to [direct]/[deviation] or "
-            "explicitly invalidated before finalizing."
+            "outstanding_probes contains entries that touch the leading "
+            f"candidate: {probes}. Per critical rules 9/12/16, each must be "
+            "either probed (queue a step) or invalidated (move to "
+            "dimensions_invalidated with a citing KNOWN_FACT) before "
+            "finalizing."
         )
     reason_lc = decision.candidate_reason.lower()
     if candidate and not any(
@@ -530,50 +346,48 @@ def _finalize_gate_violations(
             "baseline 13.8'). Query baseline values for the leading "
             "candidate before finalizing."
         )
+
+    # Mechanism gate (critical rule 14): proposed_mechanism must be
+    # populated whenever a candidate is named. Empty mechanism with a
+    # populated candidate means the reflector identified WHO but not the
+    # CAUSAL PROCESS — finalization in this state collapses "service is
+    # at fault" with "service is at fault BECAUSE …", which is exactly
+    # the failure mode reflection logs surfaced repeatedly.
+    if candidate and not decision.proposed_mechanism:
+        violations.append(
+            "proposed_mechanism is empty but leading_candidate is named. "
+            "Per critical rule 14, finalization requires naming the causal "
+            "MECHANISM — not just the entity. State the underlying process "
+            "by which the candidate produces the observed symptoms."
+        )
+
+    # Mechanism alternatives gate (critical rule 15): at least 2
+    # competing mechanisms must be enumerated whenever proposed_mechanism
+    # is set. Forces hypothesis-space enumeration before finalize so the
+    # reflector cannot collapse onto the first self-consistent story.
+    if decision.proposed_mechanism and len(decision.mechanism_alternatives) < 2:
+        violations.append(
+            "mechanism_alternatives has fewer than 2 entries. Per critical "
+            "rule 15, finalization requires explicit enumeration of at "
+            "least two competing mechanisms — list them with falsification "
+            "rationale or remaining-plausibility notes."
+        )
+
+    # Mechanism evidence gate (critical rule 14 + 9): at least one
+    # [direct] or [deviation] fact must back the mechanism claim.
+    # Mechanism claims supported only by [symptom] facts are exactly the
+    # "exception class = root cause" anti-pattern.
+    if decision.proposed_mechanism:
+        evidence_blob = "\n".join(decision.mechanism_evidence).lower()
+        if not ("[direct]" in evidence_blob or "[deviation]" in evidence_blob):
+            violations.append(
+                "mechanism_evidence does not cite any [direct] or "
+                "[deviation] KNOWN_FACT. Per critical rule 14, mechanism "
+                "claims must be backed by direct evidence — symptom-only "
+                "support is insufficient for naming a causal process."
+            )
+
     return violations
-
-
-def _untouched_plan_steps(
-    plan_steps: list[str], artifacts: ArtifactStore
-) -> list[tuple[int, str, set[str]]]:
-    """Return plan steps whose distinctive tokens have not been queried.
-
-    For each plan step we extract ``coverage_tokens`` and compute the
-    fraction that appears in the artifact store's QUERIES_EXECUTED rows
-    (preferred) and step intents. A step is "untouched" if fewer than
-    ``_PLAN_COVERAGE_THRESHOLD`` of its distinctive tokens are present.
-
-    Important: we deliberately do NOT include free-text findings or
-    KNOWN_FACTS in the coverage haystack. Those text blobs reflect what
-    was *discovered* (e.g., listing every metric field name during
-    schema inspection) rather than what was *queried*, and including
-    them produces false negatives where a downstream step's identifiers
-    happen to appear in an upstream step's schema dump. The
-    QUERIES_EXECUTED section is the executor's structured record of
-    what it actually probed, which is the right signal here.
-
-    Returns a list of ``(plan_index_1based, step_text, missing_tokens)``.
-    Steps with no distinctive tokens (purely abstract, e.g. "Reason over
-    results") are skipped — we cannot deterministically tell whether they
-    were addressed, so we err toward NOT flagging them.
-    """
-    if not plan_steps:
-        return []
-    haystack_parts: list[str] = []
-    for artifact in artifacts:
-        haystack_parts.append(artifact.step_intent or "")
-        haystack_parts.extend(artifact.queries)
-    haystack = "\n".join(haystack_parts).lower()
-    missing: list[tuple[int, str, set[str]]] = []
-    for idx, step in enumerate(plan_steps, start=1):
-        tokens = _coverage_tokens(step)
-        if not tokens:
-            continue
-        present = {t for t in tokens if t in haystack}
-        coverage = len(present) / len(tokens)
-        if coverage < _PLAN_COVERAGE_THRESHOLD:
-            missing.append((idx, step, tokens - present))
-    return missing
 
 
 def _usage_tokens(result) -> tuple[int, int]:
@@ -588,242 +402,204 @@ def _usage_tokens(result) -> tuple[int, int]:
     return int(usage.get("inputTokens", 0)), int(usage.get("outputTokens", 0))
 
 
-def _build_reflect_input(
-    objective: str,
-    plan_steps: list[str],
-    artifacts: ArtifactStore,
-    latest_n: int = 1,
-    plan_stagnation_rounds: int = 0,
-) -> str:
-    """Assemble the reflect-phase prompt with bounded context.
+def _full_usage(result) -> dict[str, int]:
+    """Pull the full Bedrock usage record off an ``AgentResult``.
 
-    Sections:
-      - ``Objective`` and the original plan (informational only).
-      - ``Completed steps``: ``[id] (step N) intent :: summary`` rows.
-      - ``KNOWN_FACTS`` (full fidelity): the durable structured facts each
-        executor recorded — never truncated, since this is the persistent
-        memory that prevents re-running discovery.
-      - ``Most recent step (full findings)``: untruncated tail for the last
-        artifact only.
+    Returns input/output plus cache read/write tokens — the latter two
+    are produced by Bedrock when prompt caching is in effect (see
+    ``cache_config`` / ``cache_tools`` in ``sub_agents.py``). Without
+    these the cache-hit rate is invisible to downstream callers and
+    benchmark token accounting under-counts cached prefixes.
     """
-    sections = [f"Objective:\n{objective}"]
+    usage = getattr(getattr(result, "metrics", None), "accumulated_usage", None)
+    if not usage:
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    return {
+        "input": int(usage.get("inputTokens", 0)),
+        "output": int(usage.get("outputTokens", 0)),
+        "cache_read": int(usage.get("cacheReadInputTokens", 0)),
+        "cache_write": int(usage.get("cacheWriteInputTokens", 0)),
+    }
 
-    if plan_steps:
-        plan_block = "\n".join(f"- {step}" for step in plan_steps)
-        sections.append(
-            f"Original plan (for context only — do not echo or restate):\n{plan_block}"
-        )
 
-    compact = artifacts.compact_table()
-    if compact:
-        sections.append(f"Completed steps (summary):\n{compact}")
+_SYMPTOM_FACTS_RECENT_CAP = 20
 
-    queries = artifacts.all_queries()
-    if queries:
-        sections.append(
-            "QUERIES_EXECUTED (what was ACTUALLY probed — use this to detect "
-            "scope-narrowing, not free-text findings):\n" + queries
-        )
 
-    deviation_facts = artifacts.all_deviation_facts()
-    if deviation_facts:
-        sections.append(
-            "KNOWN_FACTS — [deviation] evidence (incident vs baseline "
-            "comparisons — the ONLY evidence eligible for ranking "
-            "candidates; rank by RELATIVE deviation here, never by "
-            "absolute magnitude):\n" + deviation_facts
-        )
+def _build_known_facts_block(
+    artifacts: ArtifactStore, leading_candidate: str
+) -> str:
+    """Render every recorded fact in tag-priority order as one block.
 
-    direct_facts = artifacts.all_direct_facts()
-    if direct_facts:
-        sections.append(
-            "KNOWN_FACTS — [direct] evidence (these CAN support a final "
-            "attribution on their own; combine with [deviation] above "
-            "for ranking):\n" + direct_facts
-        )
-
-    symptom_facts = artifacts.all_symptom_facts()
-    if symptom_facts:
-        sections.append(
-            "KNOWN_FACTS — [symptom] evidence (PARKED HYPOTHESES — context "
-            "only, CANNOT name a mode by itself; each entry below MUST "
-            "appear in `parked_symptoms_outstanding` until it is either "
-            "promoted to [direct]/[deviation] by a follow-up query or "
-            "explicitly invalidated by another fact):\n" + symptom_facts
-        )
-
-    facts = artifacts.all_facts()
-    schema_facts: list[str] = []
-    for line in facts.splitlines():
-        lc = line.lower()
-        if (
-            "[direct]" in lc
-            or "[symptom]" in lc
-            or "[deviation]" in lc
-        ):
-            continue
-        schema_facts.append(line)
-    schema_block = "\n".join(schema_facts).strip()
-    if schema_block:
-        sections.append(
-            "KNOWN_FACTS — [schema] / unclassified (operational discoveries; "
-            "do NOT rediscover):\n" + schema_block
-        )
-
-    latest = artifacts.full_findings(last_n=latest_n)
-    if latest:
-        header = (
-            "Most recent step (full findings):"
-            if latest_n == 1
-            else f"Most recent {latest_n} steps (full findings — completed as a parallel batch):"
-        )
-        sections.append(f"{header}\n{latest}")
-
-    untouched = _untouched_plan_steps(plan_steps, artifacts)
-    if untouched:
-        lines = [f"- (plan step {idx}) {step}" for idx, step, _ in untouched]
-        sections.append(
-            "PLAN COVERAGE WARNING — the following original plan step(s) "
-            "have NOT been touched by any completed artifact (none of their "
-            "distinctive identifiers appears in any prior step's intent, "
-            "findings, or KNOWN_FACTS). Per critical rule 5, you may NOT "
-            "finalize while these remain unless KNOWN_FACTS explicitly "
-            "invalidates them. Either dispatch them (preferably in parallel "
-            "if independent) or, in a future reflect call, justify skipping "
-            "by citing the specific KNOWN_FACT that invalidates each.\n"
-            + "\n".join(lines)
-        )
-
-    if untouched and plan_stagnation_rounds >= _PLAN_STAGNATION_ROUNDS_NUDGE:
-        # Untouched-step count has not decreased for several reflect
-        # rounds. Even if the investigation is producing high-grade
-        # facts, it's exploring side-paths instead of completing the
-        # planned scope. Strong-arm the reflector back onto the plan.
-        sections.append(
-            f"PLAN STAGNATION — the count of untouched plan steps "
-            f"({len(untouched)}) has NOT decreased for "
-            f"{plan_stagnation_rounds} consecutive reflect rounds. The "
-            "investigation is producing facts but not completing the "
-            "originally planned scope. Your NEXT `next_steps` MUST "
-            "either (a) dispatch one or more of the untouched plan "
-            "steps listed above, OR (b) cite the specific KNOWN_FACT "
-            "that invalidates each remaining untouched step. Continuing "
-            "to fan out new probes outside the plan without making "
-            "progress on the planned scope is not allowed."
-        )
-
-    sections.append(
-        "Output the next step(s) to execute in `next_steps` (a list — "
-        "prefer parallel dispatch when steps target independent data "
-        "sources; otherwise return a single-element list), or finalize "
-        "with a comprehensive report in `result`. Always populate "
-        "`leading_candidate`, `candidate_reason`, `outlier_candidate`, "
-        "`outlier_reason`, `direct_indicators_outstanding`, and "
-        "`parked_symptoms_outstanding` so the orchestrator can verify "
-        "finalize gates. Never repeat a completed step. Never propose "
-        "work that contradicts KNOWN_FACTS. Honor the PLAN COVERAGE "
-        "WARNING above if present. Finalization will be REJECTED by the "
-        "orchestrator if ANY of: (a) the leading_candidate has no "
-        "[direct] evidence, (b) direct_indicators_outstanding is "
-        "non-empty, (c) candidate_reason does not record a causal-"
-        "direction walk outcome, (d) candidate_reason does not cite a "
-        "RELATIVE deviation against a comparable reference (absolute "
-        "magnitude is forbidden), or (e) parked_symptoms_outstanding "
-        "is non-empty. Use the `outlier_candidate` slot every turn to "
-        "keep the second-most-anomalous entity visible — confirmation-"
-        "bias collapse onto the leading candidate is a recurring miss "
-        "path."
+    Order is fixed so the reflector's eye always lands on
+    ranking-eligible evidence first: [deviation] → [direct] → [symptom]
+    (LRU-capped, leading-candidate whitelisted) → [schema]/unclassified.
+    Each section contributes its lines verbatim with the artifact-id
+    prefix already attached by the store; sections that are empty are
+    silently skipped so the result is dense.
+    """
+    parts: list[str] = []
+    deviation = artifacts.all_deviation_facts()
+    if deviation:
+        parts.append(deviation)
+    direct = artifacts.all_direct_facts()
+    if direct:
+        parts.append(direct)
+    symptom = artifacts.all_symptom_facts(
+        leading_candidate=leading_candidate,
+        max_recent=_SYMPTOM_FACTS_RECENT_CAP,
     )
-    return "\n\n".join(sections)
-
-
-def _build_force_finalize_input(
-    objective: str,
-    plan_steps: list[str],
-    artifacts: ArtifactStore,
-) -> str:
-    """Reflect prompt that forces the model to produce a final report now.
-
-    Used after the investigation has run long enough that further probing
-    is more likely to be confirmation-driven scope expansion than to
-    surface new evidence. Differs from the normal reflect prompt in three
-    ways:
-      - it tells the model that next_steps will be IGNORED;
-      - it explicitly suspends critical rules 5–13 and the finalize gates;
-      - it allows the model to acknowledge unknowns and outstanding
-        questions inside the `result` text rather than dispatching more
-        steps to chase them.
-    """
-    sections = [f"Objective:\n{objective}"]
-
-    if plan_steps:
-        plan_block = "\n".join(f"- {step}" for step in plan_steps)
-        sections.append(
-            f"Original plan (for context only):\n{plan_block}"
-        )
-
-    queries = artifacts.all_queries()
-    if queries:
-        sections.append(
-            "QUERIES_EXECUTED so far:\n" + queries
-        )
-
-    deviation_facts = artifacts.all_deviation_facts()
-    if deviation_facts:
-        sections.append(
-            "KNOWN_FACTS — [deviation] (incident vs baseline ratios):\n"
-            + deviation_facts
-        )
-
-    direct_facts = artifacts.all_direct_facts()
-    if direct_facts:
-        sections.append(
-            "KNOWN_FACTS — [direct] evidence:\n" + direct_facts
-        )
-
-    symptom_facts = artifacts.all_symptom_facts()
-    if symptom_facts:
-        sections.append(
-            "KNOWN_FACTS — [symptom] evidence (context only):\n"
-            + symptom_facts
-        )
-
-    facts = artifacts.all_facts()
+    if symptom:
+        parts.append(symptom)
+    all_facts = artifacts.all_facts()
     schema_lines = [
-        line for line in facts.splitlines()
+        line for line in all_facts.splitlines()
         if "[direct]" not in line.lower()
         and "[symptom]" not in line.lower()
         and "[deviation]" not in line.lower()
     ]
     schema_block = "\n".join(schema_lines).strip()
     if schema_block:
-        sections.append(
-            "KNOWN_FACTS — [schema] / unclassified:\n" + schema_block
+        parts.append(schema_block)
+    return "\n".join(parts)
+
+
+_NORMAL_REFLECT_INSTRUCTIONS = (
+    "Output the next step(s) to execute in `next_steps` (a list — "
+    "prefer parallel dispatch when steps target independent data "
+    "sources; otherwise return a single-element list), or finalize "
+    "with a comprehensive report in `result`. Always populate "
+    "`leading_candidate`, `candidate_reason`, `outlier_candidate`, "
+    "`outlier_reason`, and `outstanding_probes` so the orchestrator "
+    "can verify finalize gates. Never repeat a completed step. "
+    "Never propose work that contradicts KNOWN_FACTS. Finalization "
+    "will be REJECTED by the orchestrator if ANY of: (a) the "
+    "leading_candidate has no [direct] evidence, (b) "
+    "outstanding_probes contains entries that touch the leading "
+    "candidate, (c) candidate_reason does not record a causal-"
+    "direction walk outcome, or (d) candidate_reason does not cite "
+    "a RELATIVE deviation against a comparable reference (absolute "
+    "magnitude is forbidden). Use the `outlier_candidate` slot "
+    "every turn to keep the second-most-anomalous entity visible "
+    "— confirmation-bias collapse onto the leading candidate is a "
+    "recurring miss path."
+)
+
+_FORCE_FINALIZE_INSTRUCTIONS = (
+    "FORCE FINALIZE: the investigation has run long enough that "
+    "further probing is unlikely to change the conclusion more than "
+    "it lengthens the run. You MUST now produce your best `result` "
+    "from the evidence above. Critical rules 5–13 and the normal "
+    "finalize gates are suspended for this turn — your `next_steps` "
+    "will be IGNORED. Do not propose more probes.\n\n"
+    "EXCEPTION — critical rule 15 (ENUMERATE COMPETING MECHANISMS) "
+    "is NOT suspended. You MUST still populate `mechanism_alternatives` "
+    "with at least 2 entries when `proposed_mechanism` is set. "
+    "Treat this as the most important guard against confirmation-bias "
+    "collapse: finding one self-consistent story (especially a "
+    "demand-side / usage-pattern story like 'service X does N+1 "
+    "calls' or 'service X drives more load') does not rule out the "
+    "supply-side / dependency-degradation alternative ('the "
+    "downstream socket / connection / disk / dependency that X "
+    "consumes is itself slower'). Both stories produce identical "
+    "fingerprints when the discriminating signal isn't probed; if "
+    "you cannot rule out the symmetric supply-side mechanism with "
+    "a citing fact, you MUST list it in `mechanism_alternatives` "
+    "with status 'plausible alternative — discriminating evidence "
+    "not collected' rather than silently committing to your top "
+    "pick.\n\n"
+    "In `result`, write a comprehensive report that:\n"
+    "1. Names your best top candidate(s) with the relative-deviation "
+    "evidence that places them.\n"
+    "2. Cites the specific [deviation] / [direct] facts that ground "
+    "each named candidate.\n"
+    "3. Acknowledges what could not be determined from available "
+    "evidence (unprobed dimensions, missing baselines, etc.) — these "
+    "are caveats inside the report, NOT reasons to keep investigating.\n"
+    "4. Distinguishes the entity that is the actual cause from "
+    "entities where the symptom merely surfaces, per the evidence "
+    "at hand; if the distinction is genuinely undetermined, say so.\n\n"
+    "Populate `leading_candidate`, `candidate_reason`, "
+    "`outlier_candidate`, `outlier_reason` for the audit log, and "
+    "leave `next_steps` and `outstanding_probes` empty. The result "
+    "you produce now is what will be returned to the user."
+)
+
+
+def _build_reflect_input(
+    objective: str,
+    plan_steps: list[str],
+    artifacts: ArtifactStore,
+    leading_candidate: str = "",
+    *,
+    force_finalize: bool = False,
+) -> str:
+    """Assemble the reflect-phase prompt.
+
+    Two modes share rendering:
+      - Normal (``force_finalize=False``): full context — completed-step
+        compact table, QUERIES_EXECUTED, all four fact tags, latest
+        full findings, normal-reflect instructions.
+      - Force-finalize (``force_finalize=True``): trimmed context —
+        only deviation + direct facts (the only kinds eligible to
+        ground a final attribution); compact table, queries, symptom,
+        schema, and latest-findings sections are dropped because at
+        wrap-up time the reflector should be writing up, not auditing.
+        Closes with FORCE FINALIZE instructions that suspend most
+        finalize gates while keeping critical rule 15 (mechanism
+        enumeration) live.
+    """
+    sections = [f"Objective:\n{objective}"]
+
+    if plan_steps:
+        plan_block = "\n".join(f"- {step}" for step in plan_steps)
+        plan_label = (
+            "Original plan (for context only):"
+            if force_finalize
+            else "Original plan (for context only — do not echo or restate):"
         )
+        sections.append(f"{plan_label}\n{plan_block}")
+
+    if not force_finalize:
+        compact = artifacts.compact_table()
+        if compact:
+            sections.append(f"Completed steps (summary):\n{compact}")
+
+        queries = artifacts.all_queries()
+        if queries:
+            sections.append(
+                "QUERIES_EXECUTED (what was ACTUALLY probed — use this to detect "
+                "scope-narrowing, not free-text findings):\n" + queries
+            )
+
+        facts_block = _build_known_facts_block(artifacts, leading_candidate)
+        if facts_block:
+            sections.append(
+                "KNOWN_FACTS (tag semantics: [deviation] = relative-change "
+                "evidence, only kind eligible for candidate ranking; [direct] "
+                "= can support a final attribution on its own; [symptom] = "
+                "parked hypothesis, context only — must be promoted or "
+                "invalidated before finalize; [schema] = operational, do not "
+                "rediscover):\n" + facts_block
+            )
+
+        latest = artifacts.full_findings(last_n=1)
+        if latest:
+            sections.append("Most recent step (full findings):\n" + latest)
+    else:
+        deviation_facts = artifacts.all_deviation_facts()
+        if deviation_facts:
+            sections.append(
+                "KNOWN_FACTS — [deviation] (incident vs baseline ratios):\n"
+                + deviation_facts
+            )
+        direct_facts = artifacts.all_direct_facts()
+        if direct_facts:
+            sections.append(
+                "KNOWN_FACTS — [direct] evidence:\n" + direct_facts
+            )
 
     sections.append(
-        "FORCE FINALIZE: the investigation has run long enough that "
-        "further probing is unlikely to change the conclusion more than "
-        "it lengthens the run. You MUST now produce your best `result` "
-        "from the evidence above. Critical rules 5–13 and the normal "
-        "finalize gates are suspended for this turn — your `next_steps` "
-        "will be IGNORED. Do not propose more probes.\n\n"
-        "In `result`, write a comprehensive report that:\n"
-        "1. Names your best top candidate(s) with the relative-deviation "
-        "evidence that places them.\n"
-        "2. Cites the specific [deviation] / [direct] facts that ground "
-        "each named candidate.\n"
-        "3. Acknowledges what could not be determined from available "
-        "evidence (unprobed dimensions, missing baselines, etc.) — these "
-        "are caveats inside the report, NOT reasons to keep investigating.\n"
-        "4. Distinguishes the entity that is the actual cause from "
-        "entities where the symptom merely surfaces, per the evidence "
-        "at hand; if the distinction is genuinely undetermined, say so.\n\n"
-        "Populate `leading_candidate`, `candidate_reason`, "
-        "`outlier_candidate`, `outlier_reason` for the audit log, and "
-        "leave `next_steps` and `direct_indicators_outstanding` and "
-        "`parked_symptoms_outstanding` empty. The result you produce now "
-        "is what will be returned to the user."
+        _FORCE_FINALIZE_INSTRUCTIONS if force_finalize else _NORMAL_REFLECT_INSTRUCTIONS
     )
     return "\n\n".join(sections)
 
@@ -857,11 +633,29 @@ def _build_execute_input(step: str, artifacts: ArtifactStore) -> str:
 
 
 async def _run_phase(agent: Agent, prompt: str, phase: str, step_index: int):
-    """Invoke a sub-agent and log timing + token usage for the phase."""
+    """Invoke a sub-agent and log timing + token usage for the phase.
+
+    Returns ``(result, elapsed_ms, tokens_in, tokens_out)`` — the same
+    4-tuple call sites have always consumed. Cache tokens are surfaced
+    only on the result object's ``per_phase_usage`` attribute and via
+    the log event below, so existing callers keep working unchanged
+    while the orchestration loop can opt into the richer view.
+    """
     started = time.perf_counter()
     result = await agent.invoke_async(prompt)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    tokens_in, tokens_out = _usage_tokens(result)
+    usage = _full_usage(result)
+    tokens_in = usage["input"]
+    tokens_out = usage["output"]
+    cache_read = usage["cache_read"]
+    cache_write = usage["cache_write"]
+    # Stash full usage on the result so the orchestrator can accumulate
+    # cache stats without us having to widen the return tuple (and break
+    # every existing call site).
+    try:
+        result.per_phase_usage = usage  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover — defensive against frozen models
+        pass
     log_info_event(
         logger,
         f"[per] {phase} phase complete (step {step_index})",
@@ -871,6 +665,8 @@ async def _run_phase(agent: Agent, prompt: str, phase: str, step_index: int):
         elapsed_ms=elapsed_ms,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
     )
     return result, elapsed_ms, tokens_in, tokens_out
 
@@ -897,13 +693,13 @@ def create_per_agent(opensearch_url: str) -> Agent:
         )
 
     if not os.getenv("BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN"):
-        os.environ["BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN"] = _DEFAULT_EXECUTOR_BEDROCK_MODEL_ID
+        os.environ["BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN"] = _DEFAULT_BEDROCK_MODEL_ID
         log_info_event(
             logger,
             f"BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN not set, defaulting to "
-            f"{_DEFAULT_EXECUTOR_BEDROCK_MODEL_ID}",
+            f"{_DEFAULT_BEDROCK_MODEL_ID}",
             "per_agent.default_executor_model",
-            model_id=_DEFAULT_EXECUTOR_BEDROCK_MODEL_ID,
+            model_id=_DEFAULT_BEDROCK_MODEL_ID,
         )
 
     log_info_event(
@@ -951,6 +747,58 @@ def create_per_agent(opensearch_url: str) -> Agent:
     async def run_per_pipeline(problem_statement: str) -> str:
         artifacts = ArtifactStore()
         pipeline_started = time.perf_counter()
+        # Accumulator for Bedrock-reported token usage across every
+        # sub-agent call this pipeline makes (plan + each reflect + each
+        # executor + each executor's nested tool-use turns). Logged on
+        # pipeline finish so external benchmarks / billing stop having
+        # to estimate from SSE event deltas, which under-counts the
+        # PER pipeline's internal Bedrock traffic by ~40× (none of the
+        # internal sub-agent traffic ever surfaces as an outer-tool
+        # SSE event).
+        usage_totals = {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "phase_calls": 0,
+        }
+
+        def _accumulate(result_obj) -> None:
+            phase_usage = getattr(result_obj, "per_phase_usage", None)
+            if not phase_usage:
+                return
+            usage_totals["input"] += int(phase_usage.get("input", 0))
+            usage_totals["output"] += int(phase_usage.get("output", 0))
+            usage_totals["cache_read"] += int(phase_usage.get("cache_read", 0))
+            usage_totals["cache_write"] += int(phase_usage.get("cache_write", 0))
+            usage_totals["phase_calls"] += 1
+
+        def _attach_usage_trailer(report_text: str) -> str:
+            """Append a machine-readable token-usage trailer to the report.
+
+            Wrapped in an HTML comment so any markdown renderer hides it
+            from the user, while clients (e.g., benchmark.py) can parse
+            authoritative Bedrock-reported totals via a simple regex
+            search of the streamed text. This is the only escape hatch
+            that survives the SSE pipeline — internal sub-agent calls
+            never surface as outer SSE events, so without this trailer
+            external clients cannot see the pipeline's true token cost.
+            """
+            trailer = (
+                "\n\n<!-- per_token_usage: "
+                + json.dumps(
+                    {
+                        "input": usage_totals["input"],
+                        "output": usage_totals["output"],
+                        "cache_read": usage_totals["cache_read"],
+                        "cache_write": usage_totals["cache_write"],
+                        "phase_calls": usage_totals["phase_calls"],
+                    },
+                    separators=(",", ":"),
+                )
+                + " -->"
+            )
+            return (report_text or "") + trailer
 
         log_info_event(
             logger,
@@ -964,6 +812,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
         plan_result, _, _, _ = await _run_phase(
             plan_agent, problem_statement, "plan", step_index=0
         )
+        _accumulate(plan_result)
         plan_steps, plan_final = _planner_decision_from_result(plan_result)
 
         if plan_final:
@@ -974,7 +823,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 "per.pipeline.early_finish",
                 phase="plan",
             )
-            return plan_final
+            return _attach_usage_trailer(plan_final)
 
         if not plan_steps:
             log_warning_event(
@@ -982,7 +831,9 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 "[per] planner emitted no steps and no result; aborting",
                 "per.pipeline.empty_plan",
             )
-            return f"Planner produced no actionable plan.\n\nRaw output:\n{plan_result}"
+            return _attach_usage_trailer(
+                f"Planner produced no actionable plan.\n\nRaw output:\n{plan_result}"
+            )
 
         # ---- Execute / Reflect loop -------------------------------------
         # The executor and reflector are rebuilt fresh each iteration so
@@ -1000,6 +851,12 @@ def create_per_agent(opensearch_url: str) -> Agent:
         pending_steps: list[str] = [plan_steps[0]]
         last_reflect_text = ""
         steps_executed = 0
+        # Track the most recent reflect-phase leading_candidate so the
+        # next reflect prompt's symptom-LRU keeps every symptom about the
+        # current candidate even when older symptoms are elided. Empty
+        # string for the first iteration (no candidate has been declared
+        # yet), which falls back to the pure recency cap.
+        last_leading_candidate = ""
         # Convergence tracking: counts the cumulative number of high-grade
         # facts ([direct] or [deviation]) recorded so far. Each reflect
         # round compares the current count against this snapshot — if no
@@ -1014,16 +871,20 @@ def create_per_agent(opensearch_url: str) -> Agent:
         # are unresolved hypotheses, schema discoveries are operational).
         last_high_grade_count = 0
         stagnant_rounds = 0
-        # Plan-stagnation tracking: count consecutive reflect rounds in
-        # which the number of untouched original plan steps did not
-        # decrease. Independent from `stagnant_rounds`: the reflector can
-        # be advancing on high-grade evidence (no stagnation) while still
-        # ignoring the original plan entirely (plan stagnation).
-        last_untouched_plan_count: int | None = None
-        plan_stagnant_rounds = 0
 
         while pending_steps and steps_executed < _MAX_STEPS:
-            batch = pending_steps[: max(1, _MAX_STEPS - steps_executed)]
+            # Slice off this iteration's batch. Two ceilings apply: the
+            # remaining step budget and the parallel-executor cap. Any
+            # steps the reflector declared but we cut off here are NOT
+            # carried over — the reflect phase that runs after the batch
+            # will see the new evidence and re-decide what to dispatch
+            # next, including whether the cut-off steps are still worth
+            # running. This is the framework's intended control flow.
+            batch_ceiling = min(
+                max(1, _MAX_STEPS - steps_executed),
+                _MAX_PARALLEL_EXECUTORS,
+            )
+            batch = pending_steps[:batch_ceiling]
             batch_size = len(batch)
             batch_started = time.perf_counter()
             # Snapshot the artifact-derived KNOWN_FACTS once and reuse it for
@@ -1049,6 +910,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
 
             for i, (step_text, outcome) in enumerate(zip(batch, exec_outcomes)):
                 exec_result, exec_ms, exec_in, exec_out = outcome
+                _accumulate(exec_result)
                 step_index = steps_executed + 1 + i
                 raw_findings = str(exec_result)
                 findings, queries, facts = _extract_sections(raw_findings)
@@ -1111,77 +973,77 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 phase = "stagnant"
             last_high_grade_count = current_high_grade_count
 
-            # Plan-stagnation: did the count of untouched original plan
-            # steps shrink this round? Done after stagnation update so a
-            # round can be both 'advancing' (new high-grade) and
-            # plan-stagnant (didn't reduce untouched plan count). Skip
-            # entirely if the original plan was empty.
-            current_untouched = len(_untouched_plan_steps(plan_steps, artifacts)) if plan_steps else 0
-            if not plan_steps:
-                plan_stagnant_rounds = 0
-            elif last_untouched_plan_count is None:
-                plan_stagnant_rounds = 0
-            elif current_untouched < last_untouched_plan_count:
-                plan_stagnant_rounds = 0
-            else:
-                plan_stagnant_rounds += 1
-            last_untouched_plan_count = current_untouched
-
             log_info_event(
                 logger,
                 f"[per] convergence: phase={phase} new={new_evidence} "
                 f"stagnant_rounds={stagnant_rounds} "
-                f"high_grade_total={current_high_grade_count} "
-                f"untouched_plan={current_untouched} "
-                f"plan_stagnant_rounds={plan_stagnant_rounds}",
+                f"high_grade_total={current_high_grade_count}",
                 "per.pipeline.convergence",
                 steps_executed=steps_executed,
                 phase=phase,
                 new_high_grade=new_evidence,
                 stagnant_rounds=stagnant_rounds,
                 high_grade_total=current_high_grade_count,
-                untouched_plan_count=current_untouched,
-                plan_stagnant_rounds=plan_stagnant_rounds,
             )
 
             reflect_agent = build_reflect_agent()
             stagnant_force = stagnant_rounds >= _STAGNATION_ROUNDS_FORCE
             step_force = steps_executed >= _FORCE_FINALIZE_STEPS
-            force_finalize = stagnant_force or step_force
+            elapsed_seconds = time.perf_counter() - pipeline_started
+            wallclock_force = elapsed_seconds >= _PIPELINE_WALL_CLOCK_BUDGET_SECONDS
+            force_finalize = stagnant_force or step_force or wallclock_force
             if force_finalize:
+                if wallclock_force:
+                    triggered_by = "wallclock_budget"
+                elif stagnant_force:
+                    triggered_by = "stagnation"
+                else:
+                    triggered_by = "step_cap"
                 log_warning_event(
                     logger,
                     f"[per] force-finalize triggered at step {steps_executed} "
-                    f"(stagnant={stagnant_force}, step_cap={step_force})",
+                    f"(stagnant={stagnant_force}, step_cap={step_force}, "
+                    f"wallclock={wallclock_force} elapsed={int(elapsed_seconds)}s)",
                     "per.pipeline.force_finalize",
                     steps_executed=steps_executed,
                     stagnant_rounds=stagnant_rounds,
                     stagnation_threshold=_STAGNATION_ROUNDS_FORCE,
                     step_threshold=_FORCE_FINALIZE_STEPS,
-                    triggered_by="stagnation" if stagnant_force else "step_cap",
+                    elapsed_seconds=int(elapsed_seconds),
+                    wallclock_budget_seconds=_PIPELINE_WALL_CLOCK_BUDGET_SECONDS,
+                    triggered_by=triggered_by,
                 )
-                reflect_prompt = _build_force_finalize_input(
-                    objective=problem_statement,
-                    plan_steps=plan_steps,
-                    artifacts=artifacts,
-                )
-            else:
-                # Show the reflector full findings for every artifact in
-                # the batch we just completed, not just the most recent
-                # one — they were dispatched as a unit and must be
-                # reasoned about as a unit.
                 reflect_prompt = _build_reflect_input(
                     objective=problem_statement,
                     plan_steps=plan_steps,
                     artifacts=artifacts,
-                    latest_n=batch_size,
-                    plan_stagnation_rounds=plan_stagnant_rounds,
+                    force_finalize=True,
+                )
+            else:
+                # Reflect input always shows full findings for the LAST
+                # artifact only. Sibling artifacts from the same parallel
+                # batch contribute through (a) their compact_table row
+                # and (b) their KNOWN_FACTS entries — both already
+                # carry the artifact id, which is enough for reflect to
+                # reason about them as a unit. Including every batch
+                # sibling's full findings every turn made reflect input
+                # grow with both step count AND batch size, which is
+                # what blew past Bedrock's context window after ~10
+                # steps in earlier benchmark runs.
+                reflect_prompt = _build_reflect_input(
+                    objective=problem_statement,
+                    plan_steps=plan_steps,
+                    artifacts=artifacts,
+                    leading_candidate=last_leading_candidate,
                 )
             reflect_result, _, _, _ = await _run_phase(
                 reflect_agent, reflect_prompt, "reflect", steps_executed
             )
+            _accumulate(reflect_result)
             last_reflect_text = str(reflect_result)
             decision = _reflect_decision_from_result(reflect_result)
+            if decision.leading_candidate:
+                last_leading_candidate = decision.leading_candidate
 
             # Under force-finalize, whatever the model returns is
             # accepted as the final report — gates are suspended and
@@ -1199,8 +1061,13 @@ def create_per_agent(opensearch_url: str) -> Agent:
                     total_elapsed_ms=total_ms,
                     leading_candidate=decision.leading_candidate,
                     forced=True,
+                    total_input_tokens=usage_totals["input"],
+                    total_output_tokens=usage_totals["output"],
+                    total_cache_read_tokens=usage_totals["cache_read"],
+                    total_cache_write_tokens=usage_totals["cache_write"],
+                    total_phase_calls=usage_totals["phase_calls"],
                 )
-                return final_text
+                return _attach_usage_trailer(final_text)
 
             if decision.result:
                 violations = _finalize_gate_violations(decision, artifacts)
@@ -1239,18 +1106,15 @@ def create_per_agent(opensearch_url: str) -> Agent:
                     # Prefer dispatching the structured items first, fall
                     # back to a coaching step if none apply.
                     forced: list[str] = []
-                    for indicator in decision.direct_indicators_outstanding:
+                    for probe in decision.outstanding_probes:
                         forced.append(
-                            "Query the following outstanding direct indicator "
-                            f"for the leading candidate "
-                            f"'{decision.leading_candidate}': {indicator}"
-                        )
-                    for symptom in decision.parked_symptoms_outstanding:
-                        forced.append(
-                            "Resolve this parked symptom — either query for "
-                            "evidence that promotes it to [direct] / "
-                            "[deviation], or query for evidence that "
-                            f"explicitly invalidates it. Symptom: {symptom}"
+                            "Resolve this outstanding probe for the leading "
+                            f"candidate '{decision.leading_candidate}': "
+                            f"{probe}. Either produce [direct] / [deviation] "
+                            "facts that confirm or rule out a mechanism on "
+                            "this dimension, or record a KNOWN_FACT that "
+                            "explicitly invalidates it (move it to "
+                            "`dimensions_invalidated` next turn)."
                         )
                     if forced:
                         pending_steps = forced
@@ -1288,8 +1152,13 @@ def create_per_agent(opensearch_url: str) -> Agent:
                     steps_executed=steps_executed,
                     total_elapsed_ms=total_ms,
                     leading_candidate=decision.leading_candidate,
+                    total_input_tokens=usage_totals["input"],
+                    total_output_tokens=usage_totals["output"],
+                    total_cache_read_tokens=usage_totals["cache_read"],
+                    total_cache_write_tokens=usage_totals["cache_write"],
+                    total_phase_calls=usage_totals["phase_calls"],
                 )
-                return decision.result
+                return _attach_usage_trailer(decision.result)
 
             if not decision.next_steps:
                 log_warning_event(
@@ -1309,8 +1178,13 @@ def create_per_agent(opensearch_url: str) -> Agent:
             "[per] max steps reached without final result",
             "per.pipeline.max_steps",
             max_steps=_MAX_STEPS,
+            total_input_tokens=usage_totals["input"],
+            total_output_tokens=usage_totals["output"],
+            total_cache_read_tokens=usage_totals["cache_read"],
+            total_cache_write_tokens=usage_totals["cache_write"],
+            total_phase_calls=usage_totals["phase_calls"],
         )
-        return (
+        return _attach_usage_trailer(
             f"Max Steps Limit ({_MAX_STEPS}) Reached. Use the same conversation "
             f"to continue.\n\nLast reflection:\n{last_reflect_text or '(no reflection)'}"
         )

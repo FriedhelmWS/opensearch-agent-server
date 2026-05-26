@@ -17,9 +17,6 @@ from dataclasses import dataclass, field
 from typing import Iterator
 
 
-_DEFAULT_SUMMARY_CHARS = 280
-
-
 @dataclass
 class Artifact:
     """A single executor step's findings, stored once and referenced by id."""
@@ -33,13 +30,6 @@ class Artifact:
     tokens_in: int = 0
     tokens_out: int = 0
     elapsed_ms: int = 0
-
-    def summary(self, max_chars: int = _DEFAULT_SUMMARY_CHARS) -> str:
-        """Return a truncated single-line preview of ``findings``."""
-        text = " ".join(self.findings.split())
-        if len(text) <= max_chars:
-            return text
-        return text[: max_chars - 1].rstrip() + "…"
 
 
 @dataclass
@@ -89,25 +79,37 @@ class ArtifactStore:
     def latest(self) -> Artifact | None:
         return self._artifacts[-1] if self._artifacts else None
 
-    def compact_table(self, summary_chars: int = _DEFAULT_SUMMARY_CHARS) -> str:
+    def compact_table(self) -> str:
         """Render artifacts as a compact table for prompt injection.
 
         Format::
 
-            [A1] (step 1) <intent> :: <summary>
-            [A2] (step 2) <intent> :: <summary>
+            [A1] (step 1) <intent> [3 facts, 2 queries]
+            [A2] (step 2) <intent> [5 facts, 1 query]
             ...
 
-        Empty store returns an empty string so callers can detect "nothing
-        to inject yet".
+        Only the artifact id, step index, intent, and counts are
+        included — the durable content (KNOWN_FACTS bullets, full
+        findings of the latest step) is rendered separately by the
+        reflect prompt builder. Free-text summaries of older findings
+        were dropped because they competed for prompt budget without
+        carrying structured information the reflector could verify.
+
+        Empty store returns an empty string so callers can detect
+        "nothing to inject yet".
         """
         if not self._artifacts:
             return ""
         lines = []
         for artifact in self._artifacts:
+            n_facts = len(artifact.facts)
+            n_queries = len(artifact.queries)
+            facts_word = "fact" if n_facts == 1 else "facts"
+            queries_word = "query" if n_queries == 1 else "queries"
             lines.append(
                 f"[{artifact.id}] (step {artifact.step_index}) "
-                f"{artifact.step_intent} :: {artifact.summary(summary_chars)}"
+                f"{artifact.step_intent} "
+                f"[{n_facts} {facts_word}, {n_queries} {queries_word}]"
             )
         return "\n".join(lines)
 
@@ -162,15 +164,61 @@ class ArtifactStore:
         """
         return self._facts_with_prefix("[direct]")
 
-    def all_symptom_facts(self) -> str:
-        """Render only ``[symptom]``-tagged facts.
+    def all_symptom_facts(
+        self,
+        leading_candidate: str = "",
+        max_recent: int | None = None,
+    ) -> str:
+        """Render ``[symptom]``-tagged facts with an optional LRU cap.
 
         Symptom facts are consistent with the leading hypothesis but also
         consistent with several other modes (generic error / exception
         log lines, "downstream timed out", "connection refused"). They
         are CONTEXT only — they cannot name a mode by themselves.
+
+        Symptom volume grows quickly during a long investigation: each
+        executor step typically records several symptoms while ranking
+        them as `[symptom]` rather than promoting to `[direct]`. When the
+        symptom list exceeds the reflector's useful working set, older
+        symptoms unrelated to the current leading candidate become dead
+        weight in every reflect prompt for the rest of the run.
+
+        ``max_recent`` (when set) keeps:
+          - every symptom mentioning ``leading_candidate`` (case-insensitive),
+            so the finalize gate's parked-symptoms-resolved check still
+            sees the relevant ones in full; PLUS
+          - the most recent ``max_recent`` symptoms regardless of subject.
+
+        Older symptoms outside both buckets collapse to a single
+        ``- (… N earlier symptom facts elided)`` line so the reflector
+        knows they exist without paying their token cost.
         """
-        return self._facts_with_prefix("[symptom]")
+        all_lines = self._facts_with_prefix("[symptom]")
+        if max_recent is None or not all_lines:
+            return all_lines
+        lines = all_lines.split("\n")
+        if len(lines) <= max_recent:
+            return all_lines
+        candidate_lc = leading_candidate.lower().strip()
+        kept_indices: set[int] = set()
+        if candidate_lc:
+            for idx, line in enumerate(lines):
+                if candidate_lc in line.lower():
+                    kept_indices.add(idx)
+        # Most recent N (by artifact iteration order = chronological).
+        for idx in range(len(lines) - max_recent, len(lines)):
+            kept_indices.add(idx)
+        elided = len(lines) - len(kept_indices)
+        if elided <= 0:
+            return all_lines
+        kept_lines = [lines[i] for i in sorted(kept_indices)]
+        kept_lines.insert(
+            0,
+            f"- (… {elided} earlier symptom fact(s) elided to bound prompt "
+            "size; kept: most recent + any mentioning current leading "
+            "candidate)",
+        )
+        return "\n".join(kept_lines)
 
     def has_direct_fact_for(self, candidate: str) -> bool:
         """Whether any ``[direct]`` fact mentions the candidate component.
