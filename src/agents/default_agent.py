@@ -11,33 +11,15 @@ from pathlib import Path
 
 import httpx
 from mcp.client.streamable_http import streamable_http_client
-from strands import Agent, AgentSkills, Skill
+from strands import Agent
 from strands.tools.mcp import MCPClient
 
+from agents.skills_plugin import LoggingAgentSkills, load_skills_from_dir
 from server.constants import DEFAULT_MCP_SERVER_URL
 from utils.logging_helpers import get_logger, log_info_event
 from utils.obo_context import OboAuth
 
 logger = get_logger(__name__)
-
-
-class LoggingAgentSkills(AgentSkills):
-    """AgentSkills plugin that logs skill activations at INFO level.
-
-    The vended strands plugin logs activations at DEBUG only. This subclass
-    emits a structured INFO event whenever the LLM invokes a skill, so
-    auto-selection is visible in standard logs without enabling DEBUG
-    globally.
-    """
-
-    def _track_activated_skill(self, agent: Agent, skill_name: str) -> None:
-        log_info_event(
-            logger,
-            f"Skill activated by agent: {skill_name}",
-            "default_agent.skill_activated",
-            skill_name=skill_name,
-        )
-        super()._track_activated_skill(agent, skill_name)
 
 
 DEFAULT_SYSTEM_PROMPT = """You are a helpful OpenSearch assistant. You help users understand
@@ -61,55 +43,6 @@ When answering:
 - If you don't have the right tool for a request, explain what's available
 - Consult available skills for specialized guidance and reference documentation
 """
-
-
-def _load_all_skills() -> list[Skill]:
-    """Auto-discover and load all skills from the skills directory.
-
-    Scans ``skills/`` at the project root for subdirectories containing
-    a ``SKILL.md`` file. Each valid skill directory is loaded using the
-    Strands SDK ``Skill.from_file()`` method.
-
-    Returns:
-        List of loaded Skill objects. Invalid or missing skills are
-        skipped with a warning log.
-    """
-    project_root = Path(__file__).parent.parent.parent
-    skills_dir = project_root / "skills"
-
-    if not skills_dir.exists():
-        log_info_event(
-            logger,
-            f"Skills directory not found at {skills_dir}, skipping skill loading",
-            "default_agent.skills_dir_not_found",
-            skills_dir=str(skills_dir),
-        )
-        return []
-
-    skills = []
-    for skill_path in sorted(skills_dir.iterdir()):
-        if not skill_path.is_dir() or not (skill_path / "SKILL.md").exists():
-            continue
-        try:
-            skill = Skill.from_file(skill_path)
-            skills.append(skill)
-            log_info_event(
-                logger,
-                f"Loaded skill: {skill.name}",
-                "default_agent.skill_loaded",
-                skill_name=skill.name,
-                skill_path=str(skill_path),
-            )
-        except Exception as e:
-            log_info_event(
-                logger,
-                f"Failed to load skill at {skill_path}: {e}",
-                "default_agent.skill_load_failed",
-                skill_path=str(skill_path),
-                error=str(e),
-            )
-
-    return skills
 
 
 def create_default_agent(opensearch_url: str) -> Agent:
@@ -157,7 +90,8 @@ def create_default_agent(opensearch_url: str) -> Agent:
     tools = list(mcp_client.list_tools_sync())
 
     # Auto-discover and load all skills from skills/ directory
-    skills = _load_all_skills()
+    project_root = Path(__file__).parent.parent.parent
+    skills = load_skills_from_dir(project_root / "skills")
 
     # Prepare plugins list with AgentSkills if skills are available
     plugins = []

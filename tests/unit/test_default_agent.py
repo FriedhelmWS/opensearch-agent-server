@@ -1,7 +1,8 @@
 """Unit tests for the default agent — skill loading and agent construction.
 
 Verifies that:
-1. ``_load_all_skills()`` auto-discovers ``skills/`` directories correctly.
+1. ``load_skills_from_dir()`` (the shared helper used by both default and
+   PER agents) auto-discovers ``skills/`` directories correctly.
 2. ``create_default_agent()`` wires MCP tools and skills into the strands Agent.
 3. ``LoggingAgentSkills`` emits an INFO-level log on skill activation and
    still delegates state tracking to the parent class.
@@ -17,11 +18,8 @@ import pytest
 from strands import Skill
 
 from agents import default_agent
-from agents.default_agent import (
-    LoggingAgentSkills,
-    _load_all_skills,
-    create_default_agent,
-)
+from agents.default_agent import create_default_agent
+from agents.skills_plugin import LoggingAgentSkills, load_skills_from_dir
 
 pytestmark = pytest.mark.unit
 
@@ -39,28 +37,18 @@ def _write_skill(skill_dir: Path, name: str, description: str) -> None:
     )
 
 
-@pytest.fixture
-def fake_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect ``_load_all_skills`` to a tmp project root.
-
-    ``_load_all_skills`` resolves ``skills/`` relative to
-    ``default_agent.__file__``. We simulate a project root at ``tmp_path`` by
-    patching that module attribute to a synthetic path three levels deep.
-    """
-    fake_file = tmp_path / "src" / "agents" / "default_agent.py"
-    fake_file.parent.mkdir(parents=True, exist_ok=True)
-    fake_file.touch()
-    monkeypatch.setattr(default_agent, "__file__", str(fake_file))
-    return tmp_path
+def _repo_skills_dir() -> Path:
+    """Resolve the real repo's ``skills/`` directory."""
+    return Path(default_agent.__file__).parent.parent.parent / "skills"
 
 
-class TestLoadAllSkills:
-    """Group 1 — skill auto-discovery via ``_load_all_skills()``."""
+class TestLoadSkillsFromDir:
+    """Group 1 — skill auto-discovery via ``load_skills_from_dir()``."""
 
     @pytest.mark.parametrize("expected_name", EXPECTED_REPO_SKILLS)
     def test_discovers_expected_skill(self, expected_name: str) -> None:
         """Real repo ``skills/`` dir yields every skill in ``EXPECTED_REPO_SKILLS``."""
-        skills = _load_all_skills()
+        skills = load_skills_from_dir(_repo_skills_dir())
 
         names = [s.name for s in skills]
         assert expected_name in names, (
@@ -69,38 +57,36 @@ class TestLoadAllSkills:
         skill = next(s for s in skills if s.name == expected_name)
         assert skill.description, f"{expected_name} has empty description"
 
-    def test_discovers_skills_from_custom_dir(self, fake_project_root: Path) -> None:
+    def test_discovers_skills_from_custom_dir(self, tmp_path: Path) -> None:
         """Two fake SKILL.md files under ``skills/`` → both are returned."""
-        skills_dir = fake_project_root / "skills"
+        skills_dir = tmp_path / "skills"
         _write_skill(skills_dir / "alpha-skill", "alpha-skill", "First skill")
         _write_skill(skills_dir / "beta-skill", "beta-skill", "Second skill")
 
-        skills = _load_all_skills()
+        skills = load_skills_from_dir(skills_dir)
 
         names = sorted(s.name for s in skills)
         assert names == ["alpha-skill", "beta-skill"]
 
-    def test_returns_empty_when_skills_dir_missing(
-        self, fake_project_root: Path
-    ) -> None:
+    def test_returns_empty_when_skills_dir_missing(self, tmp_path: Path) -> None:
         """Missing ``skills/`` directory → returns [] without raising."""
-        # fake_project_root has no skills/ subdirectory
-        assert not (fake_project_root / "skills").exists()
+        missing = tmp_path / "does-not-exist"
+        assert not missing.exists()
 
-        skills = _load_all_skills()
+        skills = load_skills_from_dir(missing)
 
         assert skills == []
 
-    def test_skips_entries_without_skill_md(self, fake_project_root: Path) -> None:
+    def test_skips_entries_without_skill_md(self, tmp_path: Path) -> None:
         """Non-skill entries (loose files, dirs without SKILL.md) are skipped."""
-        skills_dir = fake_project_root / "skills"
+        skills_dir = tmp_path / "skills"
         _write_skill(skills_dir / "valid-skill", "valid-skill", "Real skill")
         # Directory without SKILL.md
         (skills_dir / "empty-dir").mkdir()
         # Stray file directly under skills/
         (skills_dir / "README.md").write_text("not a skill")
 
-        skills = _load_all_skills()
+        skills = load_skills_from_dir(skills_dir)
 
         assert [s.name for s in skills] == ["valid-skill"]
 
@@ -139,7 +125,7 @@ class TestCreateDefaultAgent:
     def test_registers_mcp_tools(self, mock_mcp_tools: list[MagicMock]) -> None:
         """MCP tools from ``list_tools_sync()`` are forwarded to the strands Agent."""
         with (
-            patch("agents.default_agent._load_all_skills", return_value=[]),
+            patch("agents.default_agent.load_skills_from_dir", return_value=[]),
             patch("agents.default_agent.Agent") as mock_agent_cls,
         ):
             create_default_agent("http://localhost:9200")
@@ -151,7 +137,7 @@ class TestCreateDefaultAgent:
     def test_attaches_logging_agent_skills_plugin(self) -> None:
         """When skills are discovered, a ``LoggingAgentSkills`` plugin is attached."""
         fake_skill = Skill(name="fake-skill", description="a fake")
-        with patch("agents.default_agent._load_all_skills", return_value=[fake_skill]):
+        with patch("agents.default_agent.load_skills_from_dir", return_value=[fake_skill]):
             agent = create_default_agent("http://localhost:9200")
 
         plugins = agent._plugin_registry._plugins
@@ -162,7 +148,7 @@ class TestCreateDefaultAgent:
 
     def test_no_skills_plugin_when_skills_dir_empty(self) -> None:
         """Zero skills discovered → no ``agent_skills`` plugin attached."""
-        with patch("agents.default_agent._load_all_skills", return_value=[]):
+        with patch("agents.default_agent.load_skills_from_dir", return_value=[]):
             agent = create_default_agent("http://localhost:9200")
 
         assert "agent_skills" not in agent._plugin_registry._plugins
@@ -170,7 +156,7 @@ class TestCreateDefaultAgent:
     @pytest.mark.parametrize("expected_name", EXPECTED_REPO_SKILLS)
     def test_real_skill_registered_in_plugin(self, expected_name: str) -> None:
         """End-to-end: each expected skill lands inside the ``agent_skills`` plugin."""
-        # Do NOT patch _load_all_skills — let the real function run against the repo.
+        # Do NOT patch load_skills_from_dir — let the real function run against the repo.
         agent = create_default_agent("http://localhost:9200")
 
         plugins = agent._plugin_registry._plugins
@@ -191,7 +177,7 @@ class TestLoggingAgentSkills:
         mock_agent = MagicMock()
         mock_agent.state.get.return_value = None
 
-        with caplog.at_level(logging.INFO, logger="agents.default_agent"):
+        with caplog.at_level(logging.INFO, logger="agents.skills_plugin"):
             plugin._track_activated_skill(mock_agent, "my-skill")
 
         activation_records = [

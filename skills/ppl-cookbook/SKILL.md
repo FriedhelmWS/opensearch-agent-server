@@ -3,11 +3,19 @@ name: ppl-cookbook
 description: >
   Battle-tested PPL idioms and known engine traps for OpenSearch — patterns
   that consistently work, and the specific syntactic / engine pitfalls that
-  consistently fail. Activate alongside ppl-reference whenever about to write
-  a PPL query involving date ranges, aggregations with sorting, large result
-  sets, wide-format indices, or text fields. Examples use placeholder field
-  names (`<entity_field>`, `<date_field>`, `<value_field>`); substitute the
-  actual names from your Phase A schema discovery.
+  consistently fail. Strictly PPL-engine and OpenSearch-API specific:
+  methodology (counter vs gauge classification, four-axis resource sweep,
+  trace self-time decomposition) lives in the ``investigation-resource-saturation``
+  and ``investigation-traces`` skills; this cookbook covers only how to
+  write the corresponding PPL or DSL queries. Activate alongside
+  ppl-reference whenever about to write a PPL query involving date ranges,
+  aggregations with sorting, large result sets, wide-format indices, or
+  text fields. Mechanism-class discriminator probe templates (network-loss,
+  cpu-compute-saturation, disk-io-saturation, etc.) live in the separate
+  ``ppl-probes`` skill — activate that one only AFTER committing a
+  ``mechanism_class``. Examples use placeholder field names (`<entity_field>`,
+  `<date_field>`, `<value_field>`); substitute the actual names from your
+  Phase A schema discovery.
 ---
 
 # PPL Cookbook
@@ -150,56 +158,21 @@ Notes:
 - An eval-derived keyword like `is_root` works in `by` clauses; raw
   predicates directly in `by` may not — `eval` it first.
 
-### Interpretation
-
-| pattern | meaning |
-|---|---|
-| `root_p95 ≫ child_p95` | parent waits on something downstream — observer of someone else's slowness |
-| only children, no roots | leaf service called by others — possible originator |
-| `root_p95 ≈ child_p95` | local processing time dominates, neither pattern |
+For how to interpret the resulting root vs child p95 patterns
+(originator vs observer, self-time decomposition), see the
+``investigation-traces`` skill (rules T.1, T.3, T.5). This cookbook
+covers only the PPL writing pattern; the methodology lives there.
 
 ---
 
 ## Wide-format / pivoted indices
 
-### The trap
-
-A wide-format metric index has hundreds or thousands of columns
-(one per `<entity>_<metric>` pair) instead of long-format
-`(time, entity, metric, value)` rows. On these indices:
-
-```ppl
-source=<wide_index> | head 1                              # may fail
-```
-
-with `too_complex_to_determinize_exception` because every column has to
-be deserialised. Worse, `stats avg(value) by <metric_name_field>` does
-not apply because there is no `metric_name` / `value` pair.
-
-### What works
-
-1. Identify wide-format with `describe <index>` — if you see hundreds
-   of `<prefix>_<suffix>` columns and no `metric_name` / `value` pair,
-   it is wide-format.
-
-2. Sample with explicit field projection (a small handful of columns):
-   ```ppl
-   source=<wide_index>
-   | fields <date_field>, `<entity1>_<metric>`, `<entity2>_<metric>`
-   | head 5
-   ```
-
-3. Group columns into families by parsing the column name (typically
-   the prefix before the first `_` is the entity; the rest is the
-   metric family — but verify with the actual schema).
-
-4. For aggregations, project the columns you want and run
-   `stats avg(...), max(...)` over each — one aggregate output per
-   (entity, metric) pair. `stats` cannot dynamically pivot; you must
-   enumerate columns explicitly.
-
-5. For per-window comparison, run TWO queries (anom window, base window)
-   each producing the per-column averages, then divide post-hoc.
+If `describe <index>` shows hundreds of `<entity>_<metric>` columns and no
+`metric_name` / `value` pair, the index is wide-format. `head 1` may fail
+with `too_complex_to_determinize_exception`; project the specific columns you
+want with `| fields <date_field>, \`<entity>_<metric>\`, ...` instead. `stats`
+cannot pivot dynamically — enumerate the columns of interest, then divide
+anomaly / baseline post-hoc.
 
 ---
 
@@ -367,89 +340,62 @@ elsewhere in body text — they tokenize the same.
 
 ---
 
-## Counters vs gauges — never compare a counter's absolute value
+## Counter rate idiom
+
+The counter-vs-gauge classification rule lives in ``investigation`` B.1;
+platform-specific field references and saturation formulas (cgroup v1
+quota, Prometheus naming, throttle counters, OTel `system.*` /
+`container.*` / `jvm.*` mappings) live in the
+``investigation-resource-saturation`` skill's "Platform-specific
+reference" section. This cookbook only covers the PPL writing pattern.
 
 ### The trap
 
-A field named like `<entity>_<resource>-seconds-total` or
-`<entity>_<resource>-bytes-total` looks like a current reading. It is
-NOT — it is a cumulative counter (total seconds / total bytes since
-process start). Direct division against a per-period quota gives
-nonsense:
-
 ```ppl
-| stats avg(`<entity>_cpu-usage-seconds-total`) as cpu,
-        avg(`<entity>_cpu-quota`) as quota
-| eval saturation = cpu / quota         # WRONG: order-of-magnitude off
+| stats avg(<counter_field>) as v
+| eval saturation = v / <quota>          # WRONG if <counter_field> is cumulative
 ```
 
-Saturation values of hundreds or thousands of percent are the symptom
-of having mistaken a counter for a rate.
+Direct `avg()` of a counter is meaningless — it averages "total work
+since process start", which keeps growing as the window slides.
+Saturation values in the hundreds or thousands of percent are the
+symptom of having mistaken a counter for a rate.
 
-### How to recognise a counter (do this in Phase A)
-
-Three heuristics, applied in order:
-
-1. **Naming convention.** Field names ending in `-total` are almost
-   always cumulative counters (Prometheus convention). Names that
-   describe a state — `*-bytes`, `*-set-bytes`, `*-rss`, `*-cache`,
-   `*-current`, queue depths — are usually gauges.
-
-2. **Sampling pattern.** Pull two consecutive sample values from
-   adjacent timestamps. If the value is monotonically non-decreasing,
-   it is a counter. If it fluctuates around a mean, it is a gauge —
-   even if its name ends in `-total`. Some emitters (rate-mode
-   exporters, some service-mesh sidecars) emit pre-rated samples
-   despite a counter-shaped name; only the sampling pattern can tell
-   you for sure.
-
-3. **Magnitude sanity check.** "An instantaneous reading much larger
-   than what an instant reading should be" indicates a counter. E.g.,
-   a CPU value of 17 seconds with a 1-second scrape interval is only
-   meaningful as elapsed time, not as instantaneous use.
-
-### How to convert a counter to a rate
-
-The rate is `(value_at_t2 - value_at_t1) / (t2 - t1)`. In PPL:
+### What works — compute rate from two boundary samples
 
 ```ppl
-| stats max(<counter>) as last_v, min(<counter>) as first_v,
-        max(<date_field>) as last_t, min(<date_field>) as first_t
+| stats max(<counter_field>) as last_v, min(<counter_field>) as first_v,
+        max(<date_field>)    as last_t, min(<date_field>)    as first_t
   by <entity_field>
 | eval rate = (last_v - first_v) / ((last_t - first_t) / 1000)
-                                               # if <date_field> is in ms
+                                                # if <date_field> is in ms
 ```
 
-For rate-based saturation against a cgroup v1 CPU quota:
+Then divide the rate by whatever per-period denominator applies
+(quota, limit, cores) to get a real saturation fraction. The
+denominator math depends on the resource and the platform —
+consult ``investigation-resource-saturation`` for those formulas.
 
-```
-rate (in cores)  = delta_cpu_seconds / window_seconds
-saturation        = rate / (quota_microseconds / 100_000)
-```
+For gauges (`*-bytes`, `*-set-bytes`, `*-rss`, `*-cache`, pre-computed
+percentile fields like `*-p95`), direct `avg()` over a window IS valid.
+Verify counter vs gauge with two consecutive sample values during
+Phase A before writing the saturation query.
 
-(`spec-cpu-quota` in cgroups v1 is microseconds-per-100ms; divide by
-100_000 to get the equivalent core fraction.)
+---
 
-### Gauges are different — direct comparison works
+## Mechanism-class discriminator probes
 
-Fields like `<entity>_memory-usage-bytes` or
-`<entity>_memory-working-set-bytes` are gauges (instantaneous samples).
-Direct `avg()` over a window gives a meaningful answer; direct division
-against `<entity>_memory-limit-bytes` gives a real saturation fraction.
-
-| name pattern (typical convention) | likely kind | comparison method |
-|---|---|---|
-| ends with `*-total` (Prometheus) | counter | rate(value) over window |
-| `*-bytes`, `*-set-bytes`, `*-rss`, `*-cache` | gauge | avg(value) over window |
-| `*-seconds-total` | counter (CPU/wall time) | rate as fraction of cores |
-| `*-quota`, `*-limit-*` | constant configuration | direct denominator |
-| pre-computed percentile (e.g. `*-p95`, `*-99`) | gauge | avg(value) over window |
-
-The "counter vs gauge" classification trumps the name. **Always verify
-with consecutive samples in Phase A** before writing a Phase B
-saturation query — getting this wrong silently produces orders-of-
-magnitude wrong saturation values and can swing the originator
-attribution.
+The canonical query templates for each registered `mechanism_class`
+(network-loss, socket-exhaustion, disk-io-saturation,
+cpu-compute-saturation, memory-pressure, gc-pause,
+dependency-degradation, injected-delay) live in the separate
+``ppl-probes`` skill. Activate that skill ONLY after the reflector has
+committed to a class — until then those probes are not relevant and
+loading them would just bloat the executor's context. The orchestrator's
+finalize gate enforces that the resulting `[direct]` / `[deviation]`
+KNOWN_FACTS contain the field-name / keyword tokens those probes
+produce, so paraphrased facts ("disk was busy") will fail the gate;
+record the verbatim field name from the probe template.
 
 ---
 

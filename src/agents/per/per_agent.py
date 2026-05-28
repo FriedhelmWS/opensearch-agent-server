@@ -3,10 +3,16 @@
 Domain methodology (root-cause analysis, security forensics, performance
 regression bisect, etc.) is supplied at runtime by skills loaded from
 ``skills/`` (see ``_load_skills`` in ``sub_agents``). The framework
-itself is domain-neutral; sub-agent prompts intentionally avoid
-hard-coding observability/RCA terminology beyond the structural
-contracts (evidence-tag syntax, JSON response shape, finalize-gate
-semantics) that the orchestrator code parses.
+itself is domain-neutral.
+
+Sub-agent prompts and orchestrator-injected instructions encode only
+structural contracts — evidence-tag syntax, structured-output schema,
+finalize-gate semantics, parallel-dispatch rules. Anything domain-
+specific (what counts as a "comparable reference", what relation graph
+to walk, what mechanisms compete with what, what ranking criterion to
+order candidates by) is delegated to whichever skill is active. When
+this comment block ever drifts out of sync with the prompt text, treat
+the prompt as the source of truth and adjust here.
 
 Behavioral parity with ml-commons ``MLPlanExecuteAndReflectAgentRunner``:
   - planner / reflector emit JSON whose ``result`` field signals
@@ -40,6 +46,7 @@ import re
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Final
 
 import boto3
 import httpx
@@ -50,8 +57,14 @@ from strands.models.model import CacheConfig
 from strands.tools.mcp import MCPClient
 
 from agents.per.artifact_store import ArtifactStore
+from agents.per.mechanism_discriminators import (
+    MechanismClass,
+    discriminator_violations,
+)
 from agents.per.sub_agents import (
+    BaselineComparison,
     PlanOutput,
+    RelatedEntityCheck,
     ReflectOutput,
     build_execute_agent,
     build_plan_agent,
@@ -71,53 +84,106 @@ logger = get_logger(__name__)
 # typical config sets the former to Opus and the latter to Sonnet 4.6.
 _DEFAULT_BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 
-# Mirrors DEFAULT_MAX_STEPS_EXECUTED in MLPlanExecuteAndReflectAgentRunner.java.
-_MAX_STEPS = 20
+@dataclass(frozen=True)
+class PipelineLimits:
+    """Pipeline thresholds expressed in REFLECT-ROUND units, not step units.
 
-# After this many steps, finalize gates STOP rejecting the reflector's
-# result. The gates are designed to catch premature finalization; once the
-# investigation has run this long, the bigger risk is unbounded looping
-# (gate keeps adding new outstanding indicators that produce more findings
-# that produce more outstanding indicators). Gate rejection is a hint, not
-# a contract — past this threshold we accept whatever conclusion the
-# reflector reaches and surface gate violations as caveats in the log.
-_FINALIZE_GATE_SOFT_CAP = 8
+    A reflect ROUND is one plan→execute→reflect cycle. A step is one
+    executor invocation; a single round can dispatch up to
+    ``max_parallel_executors`` steps in parallel, so step count grows
+    faster than round count when the reflector finds independent work.
 
-# Hard fallback step count. If we hit this without converging, force
-# finalize regardless of state. This is a safety net for cases where
-# the convergence-based triggers below somehow fail.
-_FORCE_FINALIZE_STEPS = 12
+    Investigation depth — how many distinct decisions the reflector has
+    been allowed to make — tracks rounds, not steps. Earlier versions
+    bounded the loop on step count, which let a 3-wide parallel batch
+    consume 3× the depth budget per decision. This dataclass moves all
+    depth bounds to rounds; step count is retained only as a telemetry
+    metric and as a hard ceiling.
 
-# Number of consecutive reflect rounds with no new [direct] or [deviation]
-# fact at which we treat the investigation as stagnant and switch to the
-# force-finalize prompt. Investigations that produce evidence are allowed
-# to run; investigations that don't, aren't. This handles Run-6-style
-# "reflector voluntarily keeps adding probes" failure where the reflector
-# never tries to finalize on its own — once new high-grade evidence
-# stops arriving, further probing is unlikely to change the conclusion.
-_STAGNATION_ROUNDS_FORCE = 2
+    Required ordering (verified in ``__post_init__``):
 
-# Wall-clock budget for an entire PER pipeline run, in seconds. Once
-# the elapsed time crosses this, the NEXT reflect phase switches to
-# force-finalize regardless of step count or convergence state. This
-# is the hard guarantee that pipeline runs cannot drag past ~12
-# minutes — independent of how cheaply or expensively each step
-# happens to behave on a given run. Force-finalize itself adds another
-# 30-60s for the final reflect, plus output streaming, so the
-# end-to-end ceiling is roughly budget + ~120s.
-_PIPELINE_WALL_CLOCK_BUDGET_SECONDS = 720
+      ``finalize_gate_soft_cap_rounds``
+      ``< force_finalize_after_rounds``
+      ``< max_reflect_rounds``
+    """
 
-# Maximum number of executor sub-agents we will run concurrently in a single
-# fan-out batch. The reflector is allowed to declare more independent steps
-# than this — we just slice them across multiple loop iterations. Three is
-# the sweet spot for OTel-style triple-source investigations (logs + traces
-# + metrics) where all three are commonly independent at the same step.
-# Going higher (4+) reproduces the context-overflow retry storm we hit
-# previously: each executor inherits the full ArtifactStore-derived
-# KNOWN_FACTS block plus its own multi-tool-call conversation history, and
-# 4+ of those in flight push Bedrock's accumulated payload past the model's
-# context window.
-_MAX_PARALLEL_EXECUTORS = 3
+    # After this many reflect rounds, finalize gates STOP rejecting the
+    # reflector's result. The gates catch premature finalization (one or
+    # two rounds in); past this threshold the bigger risk is unbounded
+    # looping where each gate-driven follow-up produces new outstanding
+    # indicators that produce more follow-ups. Gate rejection becomes a
+    # caveat in the log instead of a blocker.
+    finalize_gate_soft_cap_rounds: int = 3
+
+    # Hard fallback round count. If we hit this without converging, force
+    # finalize regardless of state. Sized so a typical OTel-style triple-
+    # source investigation (schema discovery + per-source comparison +
+    # baseline + candidate walk) gets at least one full cycle of headroom
+    # past the canonical 4-round floor before being force-finalized.
+    force_finalize_after_rounds: int = 5
+
+    # Absolute hard ceiling on reflect rounds. Investigations should
+    # almost always force-finalize (above) before reaching this; this is
+    # a safety net for cases where force-finalize itself fails to
+    # produce a usable result and the loop somehow keeps going.
+    max_reflect_rounds: int = 8
+
+    # Number of consecutive reflect rounds with no new [direct] /
+    # [deviation] fact at which we treat the investigation as stagnant
+    # and switch to force-finalize. Investigations that produce evidence
+    # are allowed to run; investigations that don't, aren't. This handles
+    # the "reflector voluntarily keeps adding probes" failure where the
+    # reflector never tries to finalize on its own — once new high-grade
+    # evidence stops arriving, further probing is unlikely to change
+    # the conclusion.
+    stagnation_rounds_force: int = 2
+
+    # Wall-clock budget for an entire PER pipeline run, in seconds. Once
+    # the elapsed time crosses this, the NEXT reflect phase switches to
+    # force-finalize regardless of round count or convergence state.
+    # The hard guarantee that pipeline runs cannot drag past ~12 minutes
+    # — independent of how cheaply or expensively each round happens to
+    # behave on a given run. Force-finalize itself adds another 30-60s
+    # for the final reflect plus output streaming, so the end-to-end
+    # ceiling is roughly budget + ~120s.
+    pipeline_wall_clock_budget_seconds: int = 720
+
+    # Maximum number of executor sub-agents we will run concurrently in
+    # a single fan-out batch. The reflector is allowed to declare more
+    # independent steps than this — we just slice them across multiple
+    # rounds. Three is the sweet spot for OTel-style triple-source
+    # investigations (logs + traces + metrics) where all three are
+    # commonly independent at the same round. Going higher (4+)
+    # reproduces the context-overflow retry storm: each executor
+    # inherits the full ArtifactStore-derived KNOWN_FACTS block plus
+    # its own multi-tool-call conversation history, and 4+ of those in
+    # flight push Bedrock's accumulated payload past the model's
+    # context window.
+    max_parallel_executors: int = 3
+
+    # Hard ceiling on TOTAL executor invocations across all rounds. Sized
+    # well above ``max_reflect_rounds * max_parallel_executors`` so it
+    # never trips before the round-based gates do; exists only to bound
+    # cost telemetry in pathological cases.
+    max_total_steps: int = 30
+
+    def __post_init__(self) -> None:
+        if not (
+            self.finalize_gate_soft_cap_rounds
+            < self.force_finalize_after_rounds
+            < self.max_reflect_rounds
+        ):
+            raise ValueError(
+                "PipelineLimits: round thresholds must satisfy "
+                "finalize_gate_soft_cap_rounds < force_finalize_after_rounds "
+                "< max_reflect_rounds, got "
+                f"{self.finalize_gate_soft_cap_rounds} < "
+                f"{self.force_finalize_after_rounds} < "
+                f"{self.max_reflect_rounds}"
+            )
+
+
+_LIMITS: Final = PipelineLimits()
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are an investigation orchestrator. Your role
 is to dispatch the user's investigation question to the plan→execute→
@@ -164,14 +230,17 @@ def _planner_decision_from_result(result) -> tuple[list[str], str]:
 class ReflectDecision:
     """Structured view of a reflect-phase JSON response."""
 
-    next_steps: list[str]
-    result: str
+    next_steps: list[str] = field(default_factory=list)
+    result: str = ""
     leading_candidate: str = ""
     candidate_reason: str = ""
     outlier_candidate: str = ""
     outlier_reason: str = ""
+    candidate_baseline: BaselineComparison = field(default_factory=BaselineComparison)
+    related_entities_check: RelatedEntityCheck = field(default_factory=RelatedEntityCheck)
     outstanding_probes: list[str] = field(default_factory=list)
     proposed_mechanism: str = ""
+    mechanism_class: MechanismClass = MechanismClass.OTHER
     mechanism_alternatives: list[str] = field(default_factory=list)
     mechanism_evidence: list[str] = field(default_factory=list)
     dimensions_invalidated: list[str] = field(default_factory=list)
@@ -201,8 +270,11 @@ def _reflect_decision_from_result(result) -> ReflectDecision:
         candidate_reason=(so.candidate_reason or "").strip(),
         outlier_candidate=(so.outlier_candidate or "").strip(),
         outlier_reason=(so.outlier_reason or "").strip(),
+        candidate_baseline=so.candidate_baseline or BaselineComparison(),
+        related_entities_check=so.related_entities_check or RelatedEntityCheck(),
         outstanding_probes=_clean_list(so.outstanding_probes),
         proposed_mechanism=(so.proposed_mechanism or "").strip(),
+        mechanism_class=so.mechanism_class or MechanismClass.OTHER,
         mechanism_alternatives=_clean_list(so.mechanism_alternatives),
         mechanism_evidence=_clean_list(so.mechanism_evidence),
         dimensions_invalidated=_clean_list(so.dimensions_invalidated),
@@ -258,33 +330,52 @@ def _extract_sections(findings: str) -> tuple[str, list[str], list[str]]:
     return head, queries, facts
 
 
+# Finalize-gate violation severity. ``critical`` violations are
+# evidence-quality checks whose failure means the finalize is unsound
+# regardless of how long the run has gone (e.g., naming a candidate with
+# no [direct] fact, claiming a mechanism class without its discriminator
+# token). ``weak`` violations are scope-coverage / audit-completeness
+# checks (outstanding probes still listed, relation-graph walk not
+# recorded) — useful early but, past the soft cap, more likely to drive
+# unbounded looping than to catch real errors. The soft-cap branch in
+# the pipeline drops ``weak`` violations and keeps ``critical`` ones live.
+_GATE_CRITICAL = "critical"
+_GATE_WEAK = "weak"
+
+
 def _finalize_gate_violations(
     decision: ReflectDecision, artifacts: ArtifactStore
-) -> list[str]:
+) -> list[tuple[str, str]]:
     """Deterministic checks that must pass before ``result`` is accepted.
 
     The reflector's prompt asks it to self-police several conditions
     (direct evidence required, causal-direction walk recorded, no outstanding
     indicators). These checks are duplicated in code so a reflector that
     finalizes prematurely is overruled rather than trusted. Returns a
-    list of human-readable violation messages — empty list means the
-    finalization is allowed to proceed.
+    list of ``(severity, message)`` tuples — empty list means the
+    finalization is allowed to proceed. Severity is ``_GATE_CRITICAL`` for
+    evidence-soundness checks and ``_GATE_WEAK`` for scope-coverage /
+    audit-completeness checks; the pipeline's soft-cap branch drops weak
+    violations only.
     """
     if not decision.result:
         return []
-    violations: list[str] = []
+    violations: list[tuple[str, str]] = []
     candidate = decision.leading_candidate
     if not candidate:
-        violations.append(
+        violations.append((
+            _GATE_CRITICAL,
             "leading_candidate is empty but result is populated — finalization "
-            "requires naming the entity the conclusion attributes the cause to."
-        )
+            "requires naming the entity the conclusion attributes the cause to.",
+        ))
     elif not artifacts.has_direct_fact_for(candidate):
-        violations.append(
+        violations.append((
+            _GATE_CRITICAL,
             f"No KNOWN_FACTS bullet tagged [direct] mentions '{candidate}'. "
-            "Per critical rule 9, finalization requires at least one direct "
-            "fact for the named candidate; symptom-only attribution is forbidden."
-        )
+            "Per rule 5 (RANK BY RELATIVE DEVIATION, BACK BY DIRECT EVIDENCE), "
+            "finalization requires at least one direct fact for the named "
+            "candidate; symptom-only attribution is forbidden.",
+        ))
     # outstanding_probes carries everything that still blocks finalize:
     # unqueried direct indicators, unresolved [symptom] facts, unprobed
     # dimensions. Items mentioning the leading candidate are blocking;
@@ -299,53 +390,44 @@ def _finalize_gate_violations(
     ]
     if blocking_probes:
         probes = "; ".join(blocking_probes)
-        violations.append(
+        violations.append((
+            _GATE_WEAK,
             "outstanding_probes contains entries that touch the leading "
-            f"candidate: {probes}. Per critical rules 9/12/16, each must be "
-            "either probed (queue a step) or invalidated (move to "
-            "dimensions_invalidated with a citing KNOWN_FACT) before "
-            "finalizing."
-        )
-    reason_lc = decision.candidate_reason.lower()
-    if candidate and not any(
-        marker in reason_lc
-        for marker in (
-            "walk",
-            "outbound",
-            "downstream",
-            "upstream",
-            "neighbor",
-            "neighbour",
-            "dependency",
-        )
-    ):
-        violations.append(
-            "candidate_reason does not record a causal-direction walk "
-            "outcome. Per critical rule 8, the walk is mandatory before "
-            "finalizing — record in candidate_reason that you examined "
-            "the candidate's neighbors / dependencies and either confirm "
-            "no promotion or promote one of them."
-        )
-    if candidate and not any(
-        marker in reason_lc
-        for marker in (
-            "baseline",
-            "deviation",
-            "× ",
-            "x over",
-            "x baseline",
-            "% over",
-            "fold",
-        )
-    ):
-        violations.append(
-            "candidate_reason does not cite a relative deviation against "
-            "baseline. Per critical rule 11, ranking by absolute magnitude "
-            "is forbidden — candidate_reason must include a baseline "
-            "comparison (e.g., '+47× over baseline 0.3', '+3% over "
-            "baseline 13.8'). Query baseline values for the leading "
-            "candidate before finalizing."
-        )
+            f"candidate: {probes}. Per rule 3 (SCOPE COVERAGE BEFORE "
+            "FINALIZE), each must be either probed (queue a step) or "
+            "invalidated (move to dimensions_invalidated with a citing "
+            "KNOWN_FACT) before finalizing.",
+        ))
+    if candidate and not decision.related_entities_check.is_populated():
+        violations.append((
+            _GATE_WEAK,
+            "related_entities_check.entities_examined is empty. Per rule 4 "
+            "(WALK BEFORE BLAMING), the walk is mandatory before "
+            "finalizing — name the related entities (per the active "
+            "skill's relation graph) you inspected and set "
+            "promotion_made / promoted_to accordingly. If the active "
+            "skill explicitly declares no relation graph applies to "
+            "this task, list the candidate itself as the only entity "
+            "examined to record that fact for the audit log.",
+        ))
+    if candidate and not decision.candidate_baseline.is_populated():
+        missing = []
+        if not decision.candidate_baseline.candidate_value.strip():
+            missing.append("candidate_value")
+        if not decision.candidate_baseline.reference_value.strip():
+            missing.append("reference_value")
+        if not decision.candidate_baseline.deviation_summary.strip():
+            missing.append("deviation_summary")
+        violations.append((
+            _GATE_CRITICAL,
+            "candidate_baseline is incomplete (missing: "
+            f"{', '.join(missing)}). Per rule 5 (RANK BY RELATIVE "
+            "DEVIATION), ranking by absolute magnitude is forbidden — "
+            "populate all three sub-fields with the candidate's value, "
+            "the comparable reference value (per the active skill's "
+            "ranking criterion), and a summary of the relationship "
+            "(ratio, percentage delta, fold change).",
+        ))
 
     # Mechanism gate (critical rule 14): proposed_mechanism must be
     # populated whenever a candidate is named. Empty mechanism with a
@@ -354,24 +436,26 @@ def _finalize_gate_violations(
     # at fault" with "service is at fault BECAUSE …", which is exactly
     # the failure mode reflection logs surfaced repeatedly.
     if candidate and not decision.proposed_mechanism:
-        violations.append(
+        violations.append((
+            _GATE_CRITICAL,
             "proposed_mechanism is empty but leading_candidate is named. "
-            "Per critical rule 14, finalization requires naming the causal "
-            "MECHANISM — not just the entity. State the underlying process "
-            "by which the candidate produces the observed symptoms."
-        )
+            "Per rule 6 (MECHANISM), finalization requires naming the "
+            "causal MECHANISM — not just the entity. State the underlying "
+            "process by which the candidate produces the observed symptoms.",
+        ))
 
     # Mechanism alternatives gate (critical rule 15): at least 2
     # competing mechanisms must be enumerated whenever proposed_mechanism
     # is set. Forces hypothesis-space enumeration before finalize so the
     # reflector cannot collapse onto the first self-consistent story.
     if decision.proposed_mechanism and len(decision.mechanism_alternatives) < 2:
-        violations.append(
-            "mechanism_alternatives has fewer than 2 entries. Per critical "
-            "rule 15, finalization requires explicit enumeration of at "
-            "least two competing mechanisms — list them with falsification "
-            "rationale or remaining-plausibility notes."
-        )
+        violations.append((
+            _GATE_CRITICAL,
+            "mechanism_alternatives has fewer than 2 entries. Per rule 6 "
+            "(MECHANISM), finalization requires explicit enumeration of "
+            "at least two competing mechanisms — list them with "
+            "falsification rationale or remaining-plausibility notes.",
+        ))
 
     # Mechanism evidence gate (critical rule 14 + 9): at least one
     # [direct] or [deviation] fact must back the mechanism claim.
@@ -380,14 +464,244 @@ def _finalize_gate_violations(
     if decision.proposed_mechanism:
         evidence_blob = "\n".join(decision.mechanism_evidence).lower()
         if not ("[direct]" in evidence_blob or "[deviation]" in evidence_blob):
-            violations.append(
+            violations.append((
+                _GATE_CRITICAL,
                 "mechanism_evidence does not cite any [direct] or "
-                "[deviation] KNOWN_FACT. Per critical rule 14, mechanism "
+                "[deviation] KNOWN_FACT. Per rule 6 (MECHANISM), mechanism "
                 "claims must be backed by direct evidence — symptom-only "
-                "support is insufficient for naming a causal process."
-            )
+                "support is insufficient for naming a causal process.",
+            ))
+
+    # Discriminator gate (mode coverage): if the reflector committed to
+    # a specific mechanism class, the artifact store must contain at
+    # least one [direct] / [deviation] fact carrying a discriminator
+    # token for that class. Scanning the store (not just
+    # mechanism_evidence) is intentional — the executor frequently
+    # produces a discriminator fact that the reflector forgets to cite
+    # in mechanism_evidence; we don't want the gate to reject a
+    # finalize whose underlying evidence actually exists. Conversely,
+    # a mechanism_class commitment with NO matching fact anywhere is a
+    # hard reject: it is the exact failure pattern the benchmark
+    # reflections kept surfacing (mechanism named, discriminator
+    # never queried).
+    if decision.proposed_mechanism and decision.mechanism_class != MechanismClass.OTHER:
+        high_grade_facts = "\n".join(
+            [artifacts.all_direct_facts(), artifacts.all_deviation_facts()]
+        )
+        # Combine artifact-store evidence with anything the reflector
+        # cited inline; either qualifies as "the fact exists in this
+        # run" for gate purposes.
+        combined = (
+            high_grade_facts + "\n" + "\n".join(decision.mechanism_evidence)
+        )
+        for msg in discriminator_violations(decision.mechanism_class, combined):
+            violations.append((_GATE_CRITICAL, msg))
 
     return violations
+
+
+def _discriminator_unmet(
+    decision: ReflectDecision, artifacts: ArtifactStore
+) -> bool:
+    """True iff the reflector's mechanism_class lacks any discriminator token
+    in the high-grade evidence + cited mechanism_evidence.
+
+    Same semantics as the discriminator branch of ``_finalize_gate_violations``,
+    extracted so the force-finalize branch can act on it (downgrade to OTHER)
+    without re-running the rest of the gate, which is intentionally suspended
+    at force-finalize.
+    """
+    if not decision.proposed_mechanism:
+        return False
+    if decision.mechanism_class == MechanismClass.OTHER:
+        return False
+    high_grade = "\n".join(
+        [artifacts.all_direct_facts(), artifacts.all_deviation_facts()]
+    )
+    combined = high_grade + "\n" + "\n".join(decision.mechanism_evidence)
+    return bool(discriminator_violations(decision.mechanism_class, combined))
+
+
+def _extract_assistant_text(result) -> str:
+    """Best-effort extraction of an assistant-authored final string from an
+    ``AgentResult``.
+
+    ``str(AgentResult)`` is unsuitable as a user-facing fallback because
+    its repr can include internal tool-call debugging fields. Walk the
+    standard Strands result shape (``result.message["content"][i]["text"]``
+    blocks) and concatenate any text blocks. Returns an empty string when
+    no text is available so callers can decide on their own fallback
+    string rather than getting an internal repr by accident.
+    """
+    message = getattr(result, "message", None)
+    if not message:
+        return ""
+    content = message.get("content") if isinstance(message, dict) else None
+    if not content:
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _split_violations(
+    violations: list[tuple[str, str]],
+) -> tuple[list[str], list[str]]:
+    """Partition gate violations into ``(critical, weak)`` message lists."""
+    critical: list[str] = []
+    weak: list[str] = []
+    for severity, message in violations:
+        if severity == _GATE_CRITICAL:
+            critical.append(message)
+        else:
+            weak.append(message)
+    return critical, weak
+
+
+def _compute_convergence(
+    artifacts: ArtifactStore, last_high_grade_count: int
+) -> tuple[int, int, str]:
+    """Re-count [direct]/[deviation] facts and classify the round.
+
+    Returns ``(current_high_grade_count, new_evidence, phase)`` where
+    ``phase`` is one of ``"discovery"``, ``"advancing"``, ``"stagnant"``.
+    Pure function — no global state, easy to unit-test.
+    """
+    current = sum(
+        1
+        for art in artifacts
+        for fact in art.facts
+        if fact.lstrip().lower().startswith(("[direct]", "[deviation]"))
+    )
+    new_evidence = current - last_high_grade_count
+    if current == 0:
+        return current, new_evidence, "discovery"
+    if new_evidence > 0:
+        return current, new_evidence, "advancing"
+    return current, new_evidence, "stagnant"
+
+
+def _decide_force_finalize(
+    *,
+    next_round: int,
+    stagnant_rounds: int,
+    pipeline_started: float,
+    limits: PipelineLimits,
+) -> tuple[bool, str | None, int]:
+    """Decide whether the upcoming reflect round must force-finalize.
+
+    Returns ``(force, triggered_by, elapsed_seconds)``. ``triggered_by``
+    is ``None`` when ``force`` is False; otherwise one of
+    ``"wallclock_budget"`` / ``"stagnation"`` / ``"round_cap"``.
+    """
+    elapsed = int(time.perf_counter() - pipeline_started)
+    stagnant_force = stagnant_rounds >= limits.stagnation_rounds_force
+    round_force = next_round >= limits.force_finalize_after_rounds
+    wallclock_force = elapsed >= limits.pipeline_wall_clock_budget_seconds
+    if not (stagnant_force or round_force or wallclock_force):
+        return False, None, elapsed
+    if wallclock_force:
+        return True, "wallclock_budget", elapsed
+    if stagnant_force:
+        return True, "stagnation", elapsed
+    return True, "round_cap", elapsed
+
+
+def _synthesize_followup_steps(
+    decision: ReflectDecision, all_violations: list[str]
+) -> list[str]:
+    """Build the next-iteration pending_steps after a finalize-gate reject.
+
+    Prefer probing each entry in ``outstanding_probes`` (these are the
+    structured items the reflector itself flagged as still-unresolved).
+    Fall back to a coaching step that surfaces the violations verbatim
+    when no outstanding probe is available — typically when the
+    violation is in candidate_baseline / related_entities_check shape.
+    """
+    forced: list[str] = []
+    for probe in decision.outstanding_probes:
+        forced.append(
+            "Resolve this outstanding probe for the leading "
+            f"candidate '{decision.leading_candidate}': "
+            f"{probe}. Either produce [direct] / [deviation] "
+            "facts that confirm or rule out a mechanism on "
+            "this dimension, or record a KNOWN_FACT that "
+            "explicitly invalidates it (move it to "
+            "`dimensions_invalidated` next turn)."
+        )
+    if forced:
+        return forced
+    return [
+        "The previous reflect attempt to finalize was "
+        "rejected by the finalize gate. Violations:\n- "
+        + "\n- ".join(all_violations)
+        + "\n\nProbe the leading candidate "
+        f"'{decision.leading_candidate or '(none named)'}' "
+        "directly to produce [direct] / [deviation] "
+        "evidence: query the candidate's own signals "
+        "with baseline comparison, examine its "
+        "dependencies / neighbors for the causal-"
+        "direction walk, and ensure the next "
+        "candidate_reason cites a RELATIVE deviation "
+        "against baseline (not an absolute value). "
+        "If a domain skill applies to this "
+        "investigation, follow its guidance for what "
+        "counts as direct evidence and what neighbors "
+        "to walk."
+    ]
+
+
+def _force_finalize_fallback_report(
+    *,
+    decision: ReflectDecision,
+    artifacts: ArtifactStore,
+    reflect_rounds: int,
+    steps_executed: int,
+) -> str:
+    """Synthesize a minimal report when force-finalize returned no text.
+
+    Reached only when both (a) the reflector ignored the FORCE FINALIZE
+    instruction and emitted an empty ``result``, and (b) no assistant
+    prose could be recovered from the message blocks. Surfacing
+    ``str(AgentResult)`` here would dump internal repr to the user; we
+    instead emit a clearly-labelled "incomplete" report that lists the
+    leading candidate (if any) and the best high-grade evidence we
+    have, so the run is still useful as audit material.
+    """
+    deviation = artifacts.all_deviation_facts()
+    direct = artifacts.all_direct_facts()
+    sections = [
+        "# Investigation incomplete",
+        (
+            "The PER pipeline reached the force-finalize point but the "
+            "reflector did not produce a final report. Surfacing "
+            "captured high-grade evidence below for audit."
+        ),
+        f"- reflect_rounds: {reflect_rounds}",
+        f"- steps_executed: {steps_executed}",
+    ]
+    if decision.leading_candidate:
+        sections.append(
+            f"- last leading_candidate: `{decision.leading_candidate}`"
+        )
+    if decision.proposed_mechanism:
+        sections.append(
+            f"- last proposed_mechanism: `{decision.proposed_mechanism}`"
+        )
+    if deviation:
+        sections.append("\n## [deviation] facts\n" + deviation)
+    if direct:
+        sections.append("\n## [direct] facts\n" + direct)
+    if not deviation and not direct:
+        sections.append(
+            "\nNo [direct] or [deviation] facts were recorded — the "
+            "investigation never reached evidence-quality findings."
+        )
+    return "\n".join(sections)
 
 
 def _usage_tokens(result) -> tuple[int, int]:
@@ -424,18 +738,40 @@ def _full_usage(result) -> dict[str, int]:
 
 _SYMPTOM_FACTS_RECENT_CAP = 20
 
+# Cap on the number of schema facts the reflector sees verbatim each
+# round. Schema facts (field names, units, query constraints) are WORM:
+# once recorded, the truth doesn't change. Recent schema discoveries
+# matter more than ones from the first round of an 8-round investigation.
+_SCHEMA_FACTS_RECENT_CAP = 25
+
+# Soft character budget on the entire reflect prompt. When exceeded,
+# older artifact full-findings are dropped and the LRU-collapsible fact
+# sections (symptom / schema) get tighter caps. The number is tuned for
+# ~50-60% headroom under Bedrock Sonnet's 200K-context limit, leaving
+# room for executor sub-agent payloads, system prompt, and skill content.
+_REFLECT_PROMPT_SOFT_CHAR_BUDGET = 120_000
+
 
 def _build_known_facts_block(
-    artifacts: ArtifactStore, leading_candidate: str
+    artifacts: ArtifactStore,
+    leading_candidate: str,
+    *,
+    symptom_cap: int = _SYMPTOM_FACTS_RECENT_CAP,
+    schema_cap: int = _SCHEMA_FACTS_RECENT_CAP,
 ) -> str:
     """Render every recorded fact in tag-priority order as one block.
 
     Order is fixed so the reflector's eye always lands on
     ranking-eligible evidence first: [deviation] → [direct] → [symptom]
-    (LRU-capped, leading-candidate whitelisted) → [schema]/unclassified.
-    Each section contributes its lines verbatim with the artifact-id
-    prefix already attached by the store; sections that are empty are
-    silently skipped so the result is dense.
+    (LRU-capped, leading-candidate whitelisted) → [schema]/unclassified
+    (LRU-capped). Each section contributes its lines verbatim with the
+    artifact-id prefix already attached by the store; sections that are
+    empty are silently skipped so the result is dense.
+
+    The deviation and direct sections are NEVER capped — they are the
+    only evidence eligible to ground a final attribution, and an elided
+    [direct] fact for the leading candidate would defeat the whole
+    finalize-gate machinery.
     """
     parts: list[str] = []
     deviation = artifacts.all_deviation_facts()
@@ -446,20 +782,13 @@ def _build_known_facts_block(
         parts.append(direct)
     symptom = artifacts.all_symptom_facts(
         leading_candidate=leading_candidate,
-        max_recent=_SYMPTOM_FACTS_RECENT_CAP,
+        max_recent=symptom_cap,
     )
     if symptom:
         parts.append(symptom)
-    all_facts = artifacts.all_facts()
-    schema_lines = [
-        line for line in all_facts.splitlines()
-        if "[direct]" not in line.lower()
-        and "[symptom]" not in line.lower()
-        and "[deviation]" not in line.lower()
-    ]
-    schema_block = "\n".join(schema_lines).strip()
-    if schema_block:
-        parts.append(schema_block)
+    schema = artifacts.all_schema_facts(max_recent=schema_cap)
+    if schema:
+        parts.append(schema)
     return "\n".join(parts)
 
 
@@ -467,46 +796,72 @@ _NORMAL_REFLECT_INSTRUCTIONS = (
     "Output the next step(s) to execute in `next_steps` (a list — "
     "prefer parallel dispatch when steps target independent data "
     "sources; otherwise return a single-element list), or finalize "
-    "with a comprehensive report in `result`. Always populate "
-    "`leading_candidate`, `candidate_reason`, `outlier_candidate`, "
-    "`outlier_reason`, and `outstanding_probes` so the orchestrator "
-    "can verify finalize gates. Never repeat a completed step. "
-    "Never propose work that contradicts KNOWN_FACTS. Finalization "
-    "will be REJECTED by the orchestrator if ANY of: (a) the "
-    "leading_candidate has no [direct] evidence, (b) "
-    "outstanding_probes contains entries that touch the leading "
-    "candidate, (c) candidate_reason does not record a causal-"
-    "direction walk outcome, or (d) candidate_reason does not cite "
-    "a RELATIVE deviation against a comparable reference (absolute "
-    "magnitude is forbidden). Use the `outlier_candidate` slot "
-    "every turn to keep the second-most-anomalous entity visible "
-    "— confirmation-bias collapse onto the leading candidate is a "
-    "recurring miss path."
+    "with a comprehensive report in `result`. Populate every audit "
+    "field — `leading_candidate`, `candidate_reason`, "
+    "`outlier_candidate`, `outlier_reason`, `candidate_baseline`, "
+    "`related_entities_check`, and `outstanding_probes` — every turn "
+    "so the orchestrator can verify finalize gates. Never repeat a "
+    "completed step. Never propose work that contradicts "
+    "KNOWN_FACTS.\n\n"
+    "Finalization will be REJECTED by the orchestrator if ANY of:\n"
+    "  (a) `leading_candidate` has no [direct] evidence;\n"
+    "  (b) `outstanding_probes` contains entries that touch the "
+    "leading candidate;\n"
+    "  (c) `related_entities_check.entities_examined` is empty (the "
+    "active domain skill's relation graph — dependencies, peers, "
+    "callees, parents, etc. — must have been walked, even when no "
+    "promotion happens);\n"
+    "  (d) `candidate_baseline` is incomplete (`candidate_value`, "
+    "`reference_value`, and `deviation_summary` must all be present "
+    "— a relative comparison against a comparable reference, never an "
+    "absolute magnitude).\n\n"
+    "Use the `outlier_candidate` slot every turn to keep the "
+    "second-most-anomalous entity visible — confirmation-bias "
+    "collapse onto the leading candidate is a recurring miss path.\n\n"
+    "RANKING DISCIPLINE — when an active domain skill defines a "
+    "ranking criterion (a formula, score, or comparable axis along "
+    "which candidates are ordered), `leading_candidate` MUST come "
+    "from the top of that ranking. Before naming a candidate, ensure "
+    "a [deviation] fact exists that lets the criterion be computed "
+    "for every entity with non-trivial activity in the anomaly "
+    "window; if no such ranking fact exists yet, dispatch a step "
+    "that produces it before naming a leading_candidate. Do NOT pick "
+    "candidates from intuition or from the loudest absolute change. "
+    "To deviate from the top-ranked entry, cite in "
+    "`candidate_reason` the specific [direct] fact that overrides "
+    "the skill's ranking criterion. (If no skill defines a ranking "
+    "criterion, derive one from the data: a relative-deviation × "
+    "throughput-weight composite is the framework default.)"
 )
 
 _FORCE_FINALIZE_INSTRUCTIONS = (
     "FORCE FINALIZE: the investigation has run long enough that "
     "further probing is unlikely to change the conclusion more than "
     "it lengthens the run. You MUST now produce your best `result` "
-    "from the evidence above. Critical rules 5–13 and the normal "
-    "finalize gates are suspended for this turn — your `next_steps` "
-    "will be IGNORED. Do not propose more probes.\n\n"
-    "EXCEPTION — critical rule 15 (ENUMERATE COMPETING MECHANISMS) "
-    "is NOT suspended. You MUST still populate `mechanism_alternatives` "
-    "with at least 2 entries when `proposed_mechanism` is set. "
-    "Treat this as the most important guard against confirmation-bias "
-    "collapse: finding one self-consistent story (especially a "
-    "demand-side / usage-pattern story like 'service X does N+1 "
-    "calls' or 'service X drives more load') does not rule out the "
-    "supply-side / dependency-degradation alternative ('the "
-    "downstream socket / connection / disk / dependency that X "
-    "consumes is itself slower'). Both stories produce identical "
-    "fingerprints when the discriminating signal isn't probed; if "
-    "you cannot rule out the symmetric supply-side mechanism with "
-    "a citing fact, you MUST list it in `mechanism_alternatives` "
-    "with status 'plausible alternative — discriminating evidence "
-    "not collected' rather than silently committing to your top "
-    "pick.\n\n"
+    "from the evidence above. Most finalize gates and the normal "
+    "scope-coverage discipline are suspended for this turn — your "
+    "`next_steps` will be IGNORED. Do not propose more probes.\n\n"
+    "EXCEPTION — `mechanism_alternatives` is NOT suspended. You "
+    "MUST still populate it with at least 2 entries when "
+    "`proposed_mechanism` is set. Treat this as the most important "
+    "guard against confirmation-bias collapse. When the active "
+    "domain skill names symmetric / fingerprint-equivalent "
+    "alternative mechanisms (different processes producing identical "
+    "observations), include them here even if you cannot fully "
+    "discriminate among them — list each as 'plausible alternative — "
+    "discriminating evidence not collected' rather than silently "
+    "committing to your top pick. If no skill applies, derive at "
+    "least one symmetric alternative from first principles for any "
+    "mechanism you propose.\n\n"
+    "EXCEPTION — the ranking-discipline rule is NOT suspended at "
+    "force-finalize either: `leading_candidate` MUST come from the "
+    "top of the active skill's ranking criterion (or the "
+    "framework-default deviation × throughput-weight composite) when "
+    "[deviation] facts allow that score to be computed. If you "
+    "cannot produce or cite such a ranking from the gathered "
+    "evidence, mark the conclusion explicitly low-confidence in "
+    "`result` and list the un-ranked-out candidates in "
+    "`mechanism_alternatives`.\n\n"
     "In `result`, write a comprehensive report that:\n"
     "1. Names your best top candidate(s) with the relative-deviation "
     "evidence that places them.\n"
@@ -514,14 +869,16 @@ _FORCE_FINALIZE_INSTRUCTIONS = (
     "each named candidate.\n"
     "3. Acknowledges what could not be determined from available "
     "evidence (unprobed dimensions, missing baselines, etc.) — these "
-    "are caveats inside the report, NOT reasons to keep investigating.\n"
+    "are caveats inside the report, NOT reasons to keep "
+    "investigating.\n"
     "4. Distinguishes the entity that is the actual cause from "
     "entities where the symptom merely surfaces, per the evidence "
     "at hand; if the distinction is genuinely undetermined, say so.\n\n"
     "Populate `leading_candidate`, `candidate_reason`, "
-    "`outlier_candidate`, `outlier_reason` for the audit log, and "
-    "leave `next_steps` and `outstanding_probes` empty. The result "
-    "you produce now is what will be returned to the user."
+    "`outlier_candidate`, `outlier_reason`, `candidate_baseline`, "
+    "and `related_entities_check` for the audit log, and leave "
+    "`next_steps` and `outstanding_probes` empty. The result you "
+    "produce now is what will be returned to the user."
 )
 
 
@@ -532,6 +889,7 @@ def _build_reflect_input(
     leading_candidate: str = "",
     *,
     force_finalize: bool = False,
+    char_budget: int = _REFLECT_PROMPT_SOFT_CHAR_BUDGET,
 ) -> str:
     """Assemble the reflect-phase prompt.
 
@@ -601,7 +959,81 @@ def _build_reflect_input(
     sections.append(
         _FORCE_FINALIZE_INSTRUCTIONS if force_finalize else _NORMAL_REFLECT_INSTRUCTIONS
     )
+    prompt = "\n\n".join(sections)
+
+    # Soft budget guard. If the assembled prompt is over budget, retry
+    # once with halved LRU caps and the latest-findings block dropped.
+    # We don't recurse beyond one retry — going below the half-cap risks
+    # eliding evidence the reflector actually needs to make its decision.
+    # Force-finalize input is already minimal (deviation + direct only)
+    # so it skips the retry.
+    if force_finalize or len(prompt) <= char_budget:
+        return prompt
+    log_warning_event(
+        logger,
+        f"[per] reflect prompt exceeds soft char budget "
+        f"({len(prompt)} > {char_budget}); tightening LRU caps",
+        "per.pipeline.reflect_prompt_over_budget",
+        prompt_chars=len(prompt),
+        char_budget=char_budget,
+    )
+    return _build_reflect_input_tightened(
+        objective=objective,
+        plan_steps=plan_steps,
+        artifacts=artifacts,
+        leading_candidate=leading_candidate,
+    )
+
+
+def _build_reflect_input_tightened(
+    objective: str,
+    plan_steps: list[str],
+    artifacts: ArtifactStore,
+    leading_candidate: str,
+) -> str:
+    """Slim version of ``_build_reflect_input`` for over-budget cases.
+
+    Halves the symptom + schema LRU caps and drops the most-recent-step
+    full findings (its facts are already in KNOWN_FACTS). Keeps everything
+    finalize-gate-relevant (deviation + direct in full) intact.
+    """
+    sections = [f"Objective:\n{objective}"]
+    if plan_steps:
+        plan_block = "\n".join(f"- {step}" for step in plan_steps)
+        sections.append(
+            "Original plan (for context only — do not echo or restate):\n"
+            + plan_block
+        )
+    compact = artifacts.compact_table()
+    if compact:
+        sections.append(f"Completed steps (summary):\n{compact}")
+    queries = artifacts.all_queries()
+    if queries:
+        sections.append(
+            "QUERIES_EXECUTED (what was ACTUALLY probed):\n" + queries
+        )
+    facts_block = _build_known_facts_block(
+        artifacts,
+        leading_candidate,
+        symptom_cap=max(5, _SYMPTOM_FACTS_RECENT_CAP // 2),
+        schema_cap=max(5, _SCHEMA_FACTS_RECENT_CAP // 2),
+    )
+    if facts_block:
+        sections.append(
+            "KNOWN_FACTS (older symptom / schema entries elided to fit budget):\n"
+            + facts_block
+        )
+    sections.append(_NORMAL_REFLECT_INSTRUCTIONS)
     return "\n\n".join(sections)
+
+
+# Soft character budget on the entire execute prompt. The executor's
+# multi-turn loop accumulates tool_results ON TOP of this prefix, so the
+# prefix needs more headroom than the reflect prompt: by step 8 a single
+# executor turn can carry 30-50K chars of tool_result alongside the
+# pre-injected KNOWN_FACTS/QUERIES_EXECUTED. Set lower than reflect's
+# 120K accordingly.
+_EXECUTE_PROMPT_SOFT_CHAR_BUDGET = 80_000
 
 
 def _build_execute_input(step: str, artifacts: ArtifactStore) -> str:
@@ -611,6 +1043,12 @@ def _build_execute_input(step: str, artifacts: ArtifactStore) -> str:
     memory), so KNOWN_FACTS and QUERIES_EXECUTED established by prior steps
     must be reintroduced explicitly. Without this, the executor reflexively
     re-runs index/field discovery it has no way of knowing was already done.
+
+    When the assembled prompt exceeds the soft budget, drop low-value
+    sections in priority order: queries → schema/symptom older entries →
+    keep [deviation] and [direct] full. Mirror the reflect-side LRU
+    discipline so a single long-running pipeline doesn't blow past the
+    executor's context window through repeated KNOWN_FACTS injection.
     """
     sections = [f"Step to execute:\n{step}"]
     facts = artifacts.all_facts()
@@ -629,17 +1067,96 @@ def _build_execute_input(step: str, artifacts: ArtifactStore) -> str:
         "Execute this single step and return your findings as plain text, "
         "ending with the required `QUERIES_EXECUTED:` and `KNOWN_FACTS:` sections."
     )
+    prompt = "\n\n".join(sections)
+    if len(prompt) <= _EXECUTE_PROMPT_SOFT_CHAR_BUDGET:
+        return prompt
+
+    log_warning_event(
+        logger,
+        f"[per] execute prompt exceeds soft char budget "
+        f"({len(prompt)} > {_EXECUTE_PROMPT_SOFT_CHAR_BUDGET}); "
+        "tightening to high-grade facts only",
+        "per.pipeline.execute_prompt_over_budget",
+        prompt_chars=len(prompt),
+        char_budget=_EXECUTE_PROMPT_SOFT_CHAR_BUDGET,
+    )
+    return _build_execute_input_tightened(step, artifacts)
+
+
+def _build_execute_input_tightened(step: str, artifacts: ArtifactStore) -> str:
+    """Slim version of ``_build_execute_input`` for over-budget cases.
+
+    Keeps everything an executor needs to avoid rediscovery — schema
+    facts (most recent N) and any high-grade ([deviation]/[direct])
+    facts in full — but elides older [symptom] entries and drops the
+    QUERIES_EXECUTED list entirely (executors can re-derive query text
+    from KNOWN_FACTS faster than the reflector can audit a giant list).
+    """
+    sections = [f"Step to execute:\n{step}"]
+    deviation = artifacts.all_deviation_facts()
+    direct = artifacts.all_direct_facts()
+    schema = artifacts.all_schema_facts(max_recent=15)
+    parts: list[str] = []
+    if deviation:
+        parts.append(deviation)
+    if direct:
+        parts.append(direct)
+    if schema:
+        parts.append(schema)
+    if parts:
+        sections.append(
+            "KNOWN_FACTS (older [symptom] entries elided, QUERIES_EXECUTED "
+            "elided to fit budget — use these high-grade facts directly):\n"
+            + "\n".join(parts)
+        )
+    sections.append(
+        "Execute this single step and return your findings as plain text, "
+        "ending with the required `QUERIES_EXECUTED:` and `KNOWN_FACTS:` sections."
+    )
     return "\n\n".join(sections)
+
+
+# Per-call cache hit-rate threshold below which we emit a warning. The
+# definition is the standard Anthropic / Bedrock formula:
+#
+#     hit_ratio = cache_read / (cache_read + cache_write + input)
+#
+# Anthropic's published guidance for steady-state multi-turn workflows
+# is ≥ 0.7 from the second turn onward. Using a softer 0.3 floor here
+# because:
+#   - the threshold has to fire on individual sub-agent calls, not
+#     aggregated runs, and a single call can dip without indicating a
+#     regression (e.g., the executor's first turn before the cached
+#     prefix is reused);
+#   - 0.3 is well below the "everything is uncached" 0.0 baseline but
+#     still high enough that a real misconfiguration (cache_control in
+#     the wrong place / tools list re-ordered every call) trips it.
+#
+# We additionally suppress the warning for the first time a given phase
+# is exercised in a pipeline — a brand-new prefix has nothing to read.
+_CACHE_HIT_WARN_THRESHOLD = 0.3
+
+
+def _cache_hit_ratio(usage: dict[str, int]) -> float:
+    """Standard Bedrock cache hit ratio for a single sub-agent call."""
+    cr = int(usage.get("cache_read", 0))
+    cw = int(usage.get("cache_write", 0))
+    inp = int(usage.get("input", 0))
+    denom = cr + cw + inp
+    if denom <= 0:
+        return 0.0
+    return cr / denom
 
 
 async def _run_phase(agent: Agent, prompt: str, phase: str, step_index: int):
     """Invoke a sub-agent and log timing + token usage for the phase.
 
     Returns ``(result, elapsed_ms, tokens_in, tokens_out)`` — the same
-    4-tuple call sites have always consumed. Cache tokens are surfaced
-    only on the result object's ``per_phase_usage`` attribute and via
-    the log event below, so existing callers keep working unchanged
-    while the orchestration loop can opt into the richer view.
+    4-tuple call sites have always consumed. Cache tokens (and the
+    derived hit ratio) are surfaced on the result object's
+    ``per_phase_usage`` attribute and via the log event below, so
+    existing callers keep working unchanged while the orchestration
+    loop can opt into the richer view.
     """
     started = time.perf_counter()
     result = await agent.invoke_async(prompt)
@@ -649,6 +1166,8 @@ async def _run_phase(agent: Agent, prompt: str, phase: str, step_index: int):
     tokens_out = usage["output"]
     cache_read = usage["cache_read"]
     cache_write = usage["cache_write"]
+    hit_ratio = _cache_hit_ratio(usage)
+    usage["hit_ratio"] = round(hit_ratio, 4)
     # Stash full usage on the result so the orchestrator can accumulate
     # cache stats without us having to widen the return tuple (and break
     # every existing call site).
@@ -667,6 +1186,7 @@ async def _run_phase(agent: Agent, prompt: str, phase: str, step_index: int):
         tokens_out=tokens_out,
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write,
+        cache_hit_ratio=round(hit_ratio, 4),
     )
     return result, elapsed_ms, tokens_in, tokens_out
 
@@ -749,54 +1269,160 @@ def create_per_agent(opensearch_url: str) -> Agent:
         pipeline_started = time.perf_counter()
         # Accumulator for Bedrock-reported token usage across every
         # sub-agent call this pipeline makes (plan + each reflect + each
-        # executor + each executor's nested tool-use turns). Logged on
-        # pipeline finish so external benchmarks / billing stop having
-        # to estimate from SSE event deltas, which under-counts the
-        # PER pipeline's internal Bedrock traffic by ~40× (none of the
-        # internal sub-agent traffic ever surfaces as an outer-tool
-        # SSE event).
-        usage_totals = {
+        # executor + each executor's nested tool-use turns). Three views
+        # are maintained simultaneously:
+        #   - top-level totals (input / output / cache_read / cache_write)
+        #     mirror the v1 trailer for backwards compatibility;
+        #   - ``by_phase`` lets benchmark.py answer "which phase is
+        #     expensive?" — plan/reflect tend to dominate output cost
+        #     while executor dominates input cost;
+        #   - ``per_round`` lets benchmark.py answer "did context
+        #     accumulation degrade later rounds?" by giving one row
+        #     per reflect round with its parallel executor sub-totals.
+        # Trailer is logged on pipeline finish so external benchmarks /
+        # billing stop having to estimate from SSE event deltas, which
+        # under-counts the PER pipeline's internal Bedrock traffic by
+        # ~40× (none of the internal sub-agent traffic ever surfaces as
+        # an outer-tool SSE event).
+        def _empty_phase_bucket() -> dict[str, int]:
+            return {
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+                "calls": 0,
+            }
+
+        usage_totals: dict = {
             "input": 0,
             "output": 0,
             "cache_read": 0,
             "cache_write": 0,
             "phase_calls": 0,
+            "by_phase": {
+                "plan": _empty_phase_bucket(),
+                "reflect": _empty_phase_bucket(),
+                "execute": _empty_phase_bucket(),
+            },
+            "per_round": [],  # populated as the loop runs
         }
 
-        def _accumulate(result_obj) -> None:
+        def _phase_usage(result_obj) -> dict[str, int] | None:
+            """Pull the per-phase usage dict ``_run_phase`` stashed on result."""
             phase_usage = getattr(result_obj, "per_phase_usage", None)
             if not phase_usage:
-                return
-            usage_totals["input"] += int(phase_usage.get("input", 0))
-            usage_totals["output"] += int(phase_usage.get("output", 0))
-            usage_totals["cache_read"] += int(phase_usage.get("cache_read", 0))
-            usage_totals["cache_write"] += int(phase_usage.get("cache_write", 0))
+                return None
+            return {
+                "input": int(phase_usage.get("input", 0)),
+                "output": int(phase_usage.get("output", 0)),
+                "cache_read": int(phase_usage.get("cache_read", 0)),
+                "cache_write": int(phase_usage.get("cache_write", 0)),
+            }
+
+        def _accumulate(result_obj, phase: str) -> dict[str, int] | None:
+            """Add a sub-agent call's usage to top-level + per-phase totals.
+
+            Returns the per-call usage dict so callers (the executor batch
+            loop) can stash it on per-round records. ``phase`` must be
+            one of ``"plan"`` / ``"reflect"`` / ``"execute"``.
+
+            Also fires a soft cache-regression warning when this phase's
+            second-or-later call dips below ``_CACHE_HIT_WARN_THRESHOLD``.
+            The first call in a phase has nothing to hit (the cached
+            prefix is being created), so we never warn on call #1.
+            """
+            usage = _phase_usage(result_obj)
+            if usage is None:
+                return None
+            usage_totals["input"] += usage["input"]
+            usage_totals["output"] += usage["output"]
+            usage_totals["cache_read"] += usage["cache_read"]
+            usage_totals["cache_write"] += usage["cache_write"]
             usage_totals["phase_calls"] += 1
+            bucket = usage_totals["by_phase"].setdefault(
+                phase, _empty_phase_bucket()
+            )
+            bucket["input"] += usage["input"]
+            bucket["output"] += usage["output"]
+            bucket["cache_read"] += usage["cache_read"]
+            bucket["cache_write"] += usage["cache_write"]
+            bucket["calls"] += 1
+
+            ratio = _cache_hit_ratio(usage)
+            if (
+                bucket["calls"] >= 2
+                and ratio < _CACHE_HIT_WARN_THRESHOLD
+            ):
+                log_warning_event(
+                    logger,
+                    f"[per] low cache hit ratio on {phase} call "
+                    f"#{bucket['calls']}: {ratio:.2%} "
+                    f"(threshold {_CACHE_HIT_WARN_THRESHOLD:.0%}); "
+                    "cache_control may be misconfigured or the cached "
+                    "prefix may have been invalidated (tool list "
+                    "reorder / system prompt drift).",
+                    "per.pipeline.cache_hit_low",
+                    phase=phase,
+                    phase_call_index=bucket["calls"],
+                    cache_hit_ratio=round(ratio, 4),
+                    threshold=_CACHE_HIT_WARN_THRESHOLD,
+                    input_tokens=usage["input"],
+                    cache_read_tokens=usage["cache_read"],
+                    cache_write_tokens=usage["cache_write"],
+                )
+            return usage
 
         def _attach_usage_trailer(report_text: str) -> str:
             """Append a machine-readable token-usage trailer to the report.
 
-            Wrapped in an HTML comment so any markdown renderer hides it
-            from the user, while clients (e.g., benchmark.py) can parse
-            authoritative Bedrock-reported totals via a simple regex
-            search of the streamed text. This is the only escape hatch
-            that survives the SSE pipeline — internal sub-agent calls
-            never surface as outer SSE events, so without this trailer
-            external clients cannot see the pipeline's true token cost.
+            Format (v2): a sentinel-pair HTML comment block carrying a
+            JSON object with the schema_version + breakdown. Markdown
+            renderers hide HTML comments, so end users never see this;
+            clients (e.g., benchmark.py) parse the block via the matching
+            sentinel pair to recover authoritative Bedrock-reported
+            totals. This is the only escape hatch that survives the SSE
+            pipeline — internal sub-agent calls never surface as
+            outer SSE events, so without this trailer external clients
+            cannot see the pipeline's true token cost.
+
+            The sentinel-pair (begin / end) form replaces the v1 single-
+            comment format because v1's ``-->`` terminator could
+            collide with HTML comments inside a model-authored report;
+            the explicit pair anchors parsing unambiguously and the
+            ``v=N`` field lets older clients fall back gracefully when
+            new fields appear.
             """
+            # Bake per-phase aggregate hit ratio into the trailer so
+            # benchmark.py doesn't have to recompute it. Same formula as
+            # the per-call ratio, applied to the running totals.
+            by_phase_with_ratio = {}
+            for phase_name, bucket in usage_totals["by_phase"].items():
+                by_phase_with_ratio[phase_name] = {
+                    **bucket,
+                    "cache_hit_ratio": round(_cache_hit_ratio(bucket), 4),
+                }
+            top_level_ratio = _cache_hit_ratio(
+                {
+                    "input": usage_totals["input"],
+                    "cache_read": usage_totals["cache_read"],
+                    "cache_write": usage_totals["cache_write"],
+                }
+            )
+            payload = {
+                "schema_version": 2,
+                "input": usage_totals["input"],
+                "output": usage_totals["output"],
+                "cache_read": usage_totals["cache_read"],
+                "cache_write": usage_totals["cache_write"],
+                "cache_hit_ratio": round(top_level_ratio, 4),
+                "phase_calls": usage_totals["phase_calls"],
+                "by_phase": by_phase_with_ratio,
+                "per_round": usage_totals["per_round"],
+            }
             trailer = (
-                "\n\n<!-- per_token_usage: "
-                + json.dumps(
-                    {
-                        "input": usage_totals["input"],
-                        "output": usage_totals["output"],
-                        "cache_read": usage_totals["cache_read"],
-                        "cache_write": usage_totals["cache_write"],
-                        "phase_calls": usage_totals["phase_calls"],
-                    },
-                    separators=(",", ":"),
-                )
-                + " -->"
+                "\n\n<!-- per_token_usage_begin v=2 -->\n"
+                + json.dumps(payload, separators=(",", ":"))
+                + "\n<!-- per_token_usage_end -->"
             )
             return (report_text or "") + trailer
 
@@ -812,7 +1438,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
         plan_result, _, _, _ = await _run_phase(
             plan_agent, problem_statement, "plan", step_index=0
         )
-        _accumulate(plan_result)
+        _accumulate(plan_result, phase="plan")
         plan_steps, plan_final = _planner_decision_from_result(plan_result)
 
         if plan_final:
@@ -851,6 +1477,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
         pending_steps: list[str] = [plan_steps[0]]
         last_reflect_text = ""
         steps_executed = 0
+        reflect_rounds = 0
         # Track the most recent reflect-phase leading_candidate so the
         # next reflect prompt's symptom-LRU keeps every symptom about the
         # current candidate even when older symptoms are elided. Empty
@@ -871,8 +1498,16 @@ def create_per_agent(opensearch_url: str) -> Agent:
         # are unresolved hypotheses, schema discoveries are operational).
         last_high_grade_count = 0
         stagnant_rounds = 0
+        # Bind early so the post-loop ceiling-reached branch can reach
+        # the most recent reflect decision (if the loop body ran) or
+        # fall back to a fresh empty one (if it didn't).
+        decision = ReflectDecision()
 
-        while pending_steps and steps_executed < _MAX_STEPS:
+        while (
+            pending_steps
+            and reflect_rounds < _LIMITS.max_reflect_rounds
+            and steps_executed < _LIMITS.max_total_steps
+        ):
             # Slice off this iteration's batch. Two ceilings apply: the
             # remaining step budget and the parallel-executor cap. Any
             # steps the reflector declared but we cut off here are NOT
@@ -881,8 +1516,8 @@ def create_per_agent(opensearch_url: str) -> Agent:
             # next, including whether the cut-off steps are still worth
             # running. This is the framework's intended control flow.
             batch_ceiling = min(
-                max(1, _MAX_STEPS - steps_executed),
-                _MAX_PARALLEL_EXECUTORS,
+                max(1, _LIMITS.max_total_steps - steps_executed),
+                _LIMITS.max_parallel_executors,
             )
             batch = pending_steps[:batch_ceiling]
             batch_size = len(batch)
@@ -908,10 +1543,19 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 )
             )
 
+            executor_usage_records: list[dict] = []
             for i, (step_text, outcome) in enumerate(zip(batch, exec_outcomes)):
                 exec_result, exec_ms, exec_in, exec_out = outcome
-                _accumulate(exec_result)
+                exec_usage = _accumulate(exec_result, phase="execute")
                 step_index = steps_executed + 1 + i
+                if exec_usage is not None:
+                    executor_usage_records.append(
+                        {
+                            "step": step_index,
+                            "elapsed_ms": exec_ms,
+                            **exec_usage,
+                        }
+                    )
                 raw_findings = str(exec_result)
                 findings, queries, facts = _extract_sections(raw_findings)
                 artifacts.add(
@@ -944,33 +1588,18 @@ def create_per_agent(opensearch_url: str) -> Agent:
             )
 
             # Convergence check: did this batch produce any new [direct]
-            # or [deviation] fact? If not, increment the stagnation
-            # counter; if it did, reset. The stagnation counter is the
-            # primary trigger for force-finalize — see comment at the
-            # top of the loop.
-            current_high_grade_count = sum(
-                1
-                for art in artifacts
-                for fact in art.facts
-                if fact.lstrip().lower().startswith(("[direct]", "[deviation]"))
+            # or [deviation] fact? Stagnation is only meaningful AFTER
+            # the investigation has produced at least one — the
+            # discovery phase produces only [schema] facts by design,
+            # and a strict "no high-grade for N rounds" rule would
+            # force-finalize before any per-entity comparison runs.
+            current_high_grade_count, new_evidence, phase = _compute_convergence(
+                artifacts, last_high_grade_count
             )
-            new_evidence = current_high_grade_count - last_high_grade_count
-            # Stagnation is only meaningful AFTER the investigation has
-            # produced at least one [direct] or [deviation] fact. Schema
-            # discovery / signal-family inventory phases produce only
-            # [schema] facts by design, and a strict "no high-grade for
-            # 2 rounds" rule would force-finalize before any per-entity
-            # comparison runs. Hold the counter at 0 until the first
-            # high-grade fact lands, then start monitoring stagnation.
-            if current_high_grade_count == 0:
-                stagnant_rounds = 0
-                phase = "discovery"
-            elif new_evidence > 0:
-                stagnant_rounds = 0
-                phase = "advancing"
-            else:
+            if phase == "stagnant":
                 stagnant_rounds += 1
-                phase = "stagnant"
+            else:
+                stagnant_rounds = 0
             last_high_grade_count = current_high_grade_count
 
             log_info_event(
@@ -987,30 +1616,31 @@ def create_per_agent(opensearch_url: str) -> Agent:
             )
 
             reflect_agent = build_reflect_agent()
-            stagnant_force = stagnant_rounds >= _STAGNATION_ROUNDS_FORCE
-            step_force = steps_executed >= _FORCE_FINALIZE_STEPS
-            elapsed_seconds = time.perf_counter() - pipeline_started
-            wallclock_force = elapsed_seconds >= _PIPELINE_WALL_CLOCK_BUDGET_SECONDS
-            force_finalize = stagnant_force or step_force or wallclock_force
+            # The reflect we are about to dispatch is round (reflect_rounds + 1).
+            # Use the post-increment value when comparing against thresholds
+            # so a limit of N means "force finalize when entering round N".
+            next_round = reflect_rounds + 1
+            force_finalize, triggered_by, elapsed_seconds = _decide_force_finalize(
+                next_round=next_round,
+                stagnant_rounds=stagnant_rounds,
+                pipeline_started=pipeline_started,
+                limits=_LIMITS,
+            )
             if force_finalize:
-                if wallclock_force:
-                    triggered_by = "wallclock_budget"
-                elif stagnant_force:
-                    triggered_by = "stagnation"
-                else:
-                    triggered_by = "step_cap"
                 log_warning_event(
                     logger,
-                    f"[per] force-finalize triggered at step {steps_executed} "
-                    f"(stagnant={stagnant_force}, step_cap={step_force}, "
-                    f"wallclock={wallclock_force} elapsed={int(elapsed_seconds)}s)",
+                    f"[per] force-finalize triggered at round {next_round} "
+                    f"(triggered_by={triggered_by}, "
+                    f"stagnant_rounds={stagnant_rounds}, "
+                    f"elapsed={elapsed_seconds}s)",
                     "per.pipeline.force_finalize",
+                    reflect_round=next_round,
                     steps_executed=steps_executed,
                     stagnant_rounds=stagnant_rounds,
-                    stagnation_threshold=_STAGNATION_ROUNDS_FORCE,
-                    step_threshold=_FORCE_FINALIZE_STEPS,
-                    elapsed_seconds=int(elapsed_seconds),
-                    wallclock_budget_seconds=_PIPELINE_WALL_CLOCK_BUDGET_SECONDS,
+                    stagnation_threshold=_LIMITS.stagnation_rounds_force,
+                    round_threshold=_LIMITS.force_finalize_after_rounds,
+                    elapsed_seconds=elapsed_seconds,
+                    wallclock_budget_seconds=_LIMITS.pipeline_wall_clock_budget_seconds,
                     triggered_by=triggered_by,
                 )
                 reflect_prompt = _build_reflect_input(
@@ -1036,11 +1666,35 @@ def create_per_agent(opensearch_url: str) -> Agent:
                     artifacts=artifacts,
                     leading_candidate=last_leading_candidate,
                 )
-            reflect_result, _, _, _ = await _run_phase(
+            reflect_result, reflect_ms, _, _ = await _run_phase(
                 reflect_agent, reflect_prompt, "reflect", steps_executed
             )
-            _accumulate(reflect_result)
-            last_reflect_text = str(reflect_result)
+            reflect_usage = _accumulate(reflect_result, phase="reflect")
+            reflect_rounds += 1
+            # Record this round's full usage breakdown so benchmark.py
+            # can reconstruct cost over time. The list grows once per
+            # reflect call; force-finalize / soft-cap branches read out
+            # the accumulated state below before returning.
+            usage_totals["per_round"].append(
+                {
+                    "round": reflect_rounds,
+                    "force_finalize": force_finalize,
+                    "reflect": {
+                        "elapsed_ms": reflect_ms,
+                        **(
+                            reflect_usage
+                            or {
+                                "input": 0,
+                                "output": 0,
+                                "cache_read": 0,
+                                "cache_write": 0,
+                            }
+                        ),
+                    },
+                    "executors": executor_usage_records,
+                }
+            )
+            last_reflect_text = _extract_assistant_text(reflect_result)
             decision = _reflect_decision_from_result(reflect_result)
             if decision.leading_candidate:
                 last_leading_candidate = decision.leading_candidate
@@ -1051,12 +1705,65 @@ def create_per_agent(opensearch_url: str) -> Agent:
             # `result` despite the explicit instruction, fall back to
             # surfacing the raw text so the user gets something.
             if force_finalize:
-                final_text = decision.result or last_reflect_text or "(empty force-finalize response)"
+                # Discriminator gate: the only critical gate we keep live
+                # at force-finalize. Rejecting outright would mean
+                # returning nothing, so instead we DOWNGRADE the
+                # commitment — rewrite mechanism_class to OTHER and
+                # prepend a caveat to the result so the user sees that
+                # the named mechanism was not backed by its
+                # discriminator. This catches the failure pattern where
+                # the reflector keeps proposing a class whose
+                # discriminator token was never observed and the
+                # round/wallclock cap finally lets it through.
+                downgraded_class: MechanismClass | None = None
+                if _discriminator_unmet(decision, artifacts):
+                    downgraded_class = decision.mechanism_class
+                    log_warning_event(
+                        logger,
+                        "[per] force-finalize: discriminator token never "
+                        f"observed for mechanism_class={downgraded_class.value}; "
+                        "downgrading to OTHER and surfacing caveat",
+                        "per.pipeline.force_finalize_downgrade",
+                        reflect_rounds=reflect_rounds,
+                        steps_executed=steps_executed,
+                        original_mechanism_class=downgraded_class.value,
+                        leading_candidate=decision.leading_candidate,
+                    )
+                    decision.mechanism_class = MechanismClass.OTHER
+
+                base_text = (
+                    decision.result
+                    or last_reflect_text
+                    or _force_finalize_fallback_report(
+                        decision=decision,
+                        artifacts=artifacts,
+                        reflect_rounds=reflect_rounds,
+                        steps_executed=steps_executed,
+                    )
+                )
+                if downgraded_class is not None:
+                    caveat = (
+                        f"> **Caveat (force-finalize downgrade):** the "
+                        f"reflector named `{downgraded_class.value}` as the "
+                        "mechanism, but no [direct] / [deviation] fact in "
+                        "this run carries a discriminator token for that "
+                        "class (e.g. `cfs_throttled` for "
+                        "cpu-compute-saturation, `packets_dropped` / `RTO` "
+                        "for network-loss, `working_set` / `OOMKilled` for "
+                        "memory-pressure). The mechanism is therefore "
+                        "**unverified**; treat the named cause as the "
+                        "reflector's best guess from indirect evidence "
+                        "rather than a discriminator-backed conclusion."
+                    )
+                    final_text = caveat + "\n\n" + base_text
+                else:
+                    final_text = base_text
                 total_ms = int((time.perf_counter() - pipeline_started) * 1000)
                 log_info_event(
                     logger,
                     "[per] pipeline complete (force-finalized)",
                     "per.pipeline.finish",
+                    reflect_rounds=reflect_rounds,
                     steps_executed=steps_executed,
                     total_elapsed_ms=total_ms,
                     leading_candidate=decision.leading_candidate,
@@ -1070,78 +1777,49 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 return _attach_usage_trailer(final_text)
 
             if decision.result:
-                violations = _finalize_gate_violations(decision, artifacts)
-                # Past the soft cap, accept the reflector's finalization
-                # even if gates would reject it. Gate rejection is meant to
-                # catch premature finalization (one or two cycles in); past
-                # ~8 steps the bigger risk is unbounded looping where each
-                # gate-driven follow-up produces new outstanding indicators
-                # that produce more follow-ups. Surface the unmet gates as
-                # warnings in the log rather than blocking the user.
-                if violations and steps_executed >= _FINALIZE_GATE_SOFT_CAP:
+                raw_violations = _finalize_gate_violations(decision, artifacts)
+                critical, weak = _split_violations(raw_violations)
+                # Soft cap behaviour: past `finalize_gate_soft_cap_rounds`,
+                # drop WEAK violations only (scope coverage, audit
+                # completeness). CRITICAL violations — no [direct] fact
+                # for the candidate, missing mechanism, missing
+                # alternatives, missing discriminator token — stay
+                # binding regardless of round count, because accepting
+                # those past the soft cap would silently allow exactly
+                # the symptom-only / un-falsifiable mechanism finalization
+                # the gates exist to catch. Unbounded looping is bounded
+                # separately by `pipeline_wall_clock_budget_seconds` and
+                # `force_finalize_after_rounds` (which suspends gates
+                # except `mechanism_alternatives`).
+                if weak and reflect_rounds >= _LIMITS.finalize_gate_soft_cap_rounds:
                     log_warning_event(
                         logger,
-                        "[per] finalize gates not satisfied but soft cap "
-                        "reached; accepting result with caveats",
+                        "[per] weak finalize gates not satisfied but soft "
+                        "cap reached; dropping weak gates, keeping critical",
                         "per.pipeline.finalize_soft_cap",
+                        reflect_rounds=reflect_rounds,
                         steps_executed=steps_executed,
-                        violation_count=len(violations),
-                        violations=violations,
+                        weak_violation_count=len(weak),
+                        critical_violation_count=len(critical),
+                        weak_violations=weak,
                         leading_candidate=decision.leading_candidate,
                     )
-                    violations = []
+                    weak = []
+                violations = critical + weak
                 if violations:
                     log_warning_event(
                         logger,
                         "[per] finalize gates rejected reflector's result; "
                         "forcing continued investigation",
                         "per.pipeline.finalize_rejected",
+                        reflect_rounds=reflect_rounds,
                         steps_executed=steps_executed,
                         violation_count=len(violations),
+                        critical_violation_count=len(critical),
+                        weak_violation_count=len(weak),
                         leading_candidate=decision.leading_candidate,
                     )
-                    # Synthesize follow-up steps. We can have multiple
-                    # categories of binding violation at once — outstanding
-                    # indicators, parked symptoms, missing baseline / walk.
-                    # Prefer dispatching the structured items first, fall
-                    # back to a coaching step if none apply.
-                    forced: list[str] = []
-                    for probe in decision.outstanding_probes:
-                        forced.append(
-                            "Resolve this outstanding probe for the leading "
-                            f"candidate '{decision.leading_candidate}': "
-                            f"{probe}. Either produce [direct] / [deviation] "
-                            "facts that confirm or rule out a mechanism on "
-                            "this dimension, or record a KNOWN_FACT that "
-                            "explicitly invalidates it (move it to "
-                            "`dimensions_invalidated` next turn)."
-                        )
-                    if forced:
-                        pending_steps = forced
-                    else:
-                        # The reflector wanted to finalize but the violation
-                        # is in `candidate_reason` shape (missing causal
-                        # walk or missing baseline citation). Coach it
-                        # explicitly without prescribing domain specifics —
-                        # the relevant skill (if any) carries those.
-                        pending_steps = [
-                            "The previous reflect attempt to finalize was "
-                            "rejected by the finalize gate. Violations:\n- "
-                            + "\n- ".join(violations)
-                            + "\n\nProbe the leading candidate "
-                            f"'{decision.leading_candidate or '(none named)'}' "
-                            "directly to produce [direct] / [deviation] "
-                            "evidence: query the candidate's own signals "
-                            "with baseline comparison, examine its "
-                            "dependencies / neighbors for the causal-"
-                            "direction walk, and ensure the next "
-                            "candidate_reason cites a RELATIVE deviation "
-                            "against baseline (not an absolute value). "
-                            "If a domain skill applies to this "
-                            "investigation, follow its guidance for what "
-                            "counts as direct evidence and what neighbors "
-                            "to walk."
-                        ]
+                    pending_steps = _synthesize_followup_steps(decision, violations)
                     continue
 
                 total_ms = int((time.perf_counter() - pipeline_started) * 1000)
@@ -1149,6 +1827,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
                     logger,
                     "[per] pipeline complete",
                     "per.pipeline.finish",
+                    reflect_rounds=reflect_rounds,
                     steps_executed=steps_executed,
                     total_elapsed_ms=total_ms,
                     leading_candidate=decision.leading_candidate,
@@ -1171,24 +1850,43 @@ def create_per_agent(opensearch_url: str) -> Agent:
 
             pending_steps = decision.next_steps
 
-        # Loop exhausted without a final result — mirror the Java runner's
-        # "Max Steps Limit" message and surface the last reflector output.
+        # Loop exhausted without a final result. This is normally
+        # unreachable — force-finalize triggers earlier — but we surface
+        # the last reflector output so the user gets something usable.
         log_warning_event(
             logger,
-            "[per] max steps reached without final result",
-            "per.pipeline.max_steps",
-            max_steps=_MAX_STEPS,
+            "[per] reflect-round / step ceiling reached without final result",
+            "per.pipeline.ceiling_reached",
+            reflect_rounds=reflect_rounds,
+            steps_executed=steps_executed,
+            max_reflect_rounds=_LIMITS.max_reflect_rounds,
+            max_total_steps=_LIMITS.max_total_steps,
             total_input_tokens=usage_totals["input"],
             total_output_tokens=usage_totals["output"],
             total_cache_read_tokens=usage_totals["cache_read"],
             total_cache_write_tokens=usage_totals["cache_write"],
             total_phase_calls=usage_totals["phase_calls"],
         )
+        tail = last_reflect_text or _force_finalize_fallback_report(
+            decision=decision,
+            artifacts=artifacts,
+            reflect_rounds=reflect_rounds,
+            steps_executed=steps_executed,
+        )
         return _attach_usage_trailer(
-            f"Max Steps Limit ({_MAX_STEPS}) Reached. Use the same conversation "
-            f"to continue.\n\nLast reflection:\n{last_reflect_text or '(no reflection)'}"
+            f"Investigation ceiling reached "
+            f"(rounds={reflect_rounds}/{_LIMITS.max_reflect_rounds}, "
+            f"steps={steps_executed}/{_LIMITS.max_total_steps}) "
+            "without a final result. Use the same conversation to "
+            f"continue.\n\nLast reflection:\n{tail}"
         )
 
+    # ``temperature`` deliberately omitted: newer Claude inference
+    # profiles on Bedrock reject the parameter ("ValidationException:
+    # `temperature` is deprecated for this model"). The orchestrator's
+    # job is just relaying the user's question into the
+    # ``run_per_pipeline`` tool and returning the result verbatim, so
+    # the loss of explicit sampling control is harmless here.
     orchestrator_model = BedrockModel(
         model_id=os.environ["BEDROCK_INFERENCE_PROFILE_ARN"],
         boto_session=boto3.Session(),

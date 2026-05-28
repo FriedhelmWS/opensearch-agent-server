@@ -24,19 +24,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
 
 import boto3
 from botocore.config import Config as BotocoreConfig
 from pydantic import BaseModel, Field, field_validator
-from strands import Agent, AgentSkills, Skill
-from strands.hooks.events import BeforeToolCallEvent
+from strands import Agent, Skill
+from strands.hooks.events import AfterToolCallEvent, BeforeToolCallEvent
 from strands.models.bedrock import BedrockModel
 from strands.models.model import CacheConfig
 from strands.tools.mcp import MCPClient
-from strands.tools.mcp.mcp_agent_tool import MCPAgentTool
-from strands.types._events import ToolResultEvent
 
+from agents.per.mechanism_discriminators import MechanismClass
+from agents.skills_plugin import LoggingAgentSkills, load_skills_from_dir
 from utils.logging_helpers import get_logger, log_info_event
 
 logger = get_logger(__name__)
@@ -64,48 +63,20 @@ def _load_skills() -> list[Skill]:
     if _skills_cache is not None:
         return _skills_cache
     project_root = Path(__file__).parent.parent.parent.parent
-    skills_dir = project_root / "skills"
-    skills: list[Skill] = []
-    if not skills_dir.exists():
-        log_info_event(
-            logger,
-            f"[per] skills directory not found at {skills_dir}; sub-agents "
-            "will run without domain skills",
-            "per.sub_agents.skills_dir_missing",
-            skills_dir=str(skills_dir),
-        )
-        _skills_cache = []
-        return _skills_cache
-    for skill_path in sorted(skills_dir.iterdir()):
-        if not skill_path.is_dir() or not (skill_path / "SKILL.md").exists():
-            continue
-        try:
-            skill = Skill.from_file(skill_path)
-            skills.append(skill)
-            log_info_event(
-                logger,
-                f"[per] loaded skill: {skill.name}",
-                "per.sub_agents.skill_loaded",
-                skill_name=skill.name,
-            )
-        except Exception as exc:  # pragma: no cover — surface load errors but keep going
-            log_info_event(
-                logger,
-                f"[per] failed to load skill at {skill_path}: {exc}",
-                "per.sub_agents.skill_load_failed",
-                skill_path=str(skill_path),
-                error=str(exc),
-            )
-    _skills_cache = skills
+    _skills_cache = load_skills_from_dir(project_root / "skills")
     return _skills_cache
 
 
 def _skills_plugin() -> list:
-    """Return a Strands plugin list with ``AgentSkills`` if any skills loaded."""
+    """Return a Strands plugin list with ``LoggingAgentSkills`` if any skills loaded.
+
+    Uses ``LoggingAgentSkills`` so PER skill activations are visible at
+    INFO without enabling DEBUG globally.
+    """
     skills = _load_skills()
     if not skills:
         return []
-    return [AgentSkills(skills=skills)]
+    return [LoggingAgentSkills(skills=skills)]
 
 
 # Per-tool-result text truncation cap. The executor agent dispatches MCP
@@ -128,67 +99,65 @@ def _skills_plugin() -> list:
 _MCP_TOOL_RESULT_MAX_CHARS = 50_000
 
 
-class _TruncatingMCPTool(MCPAgentTool):
-    """MCPAgentTool wrapper that caps each tool_result's text content.
+def _truncate_tool_result_hook(event: AfterToolCallEvent) -> None:
+    """Cap each tool_result's text content in place.
 
-    Wraps an existing :class:`MCPAgentTool` and proxies every attribute
-    except :meth:`stream`, which yields events through the parent and
-    rewrites :class:`ToolResultEvent` payloads in flight to truncate
-    oversized text content. The MCP server still pages over the full
-    response — only the executor-conversation copy is bounded, so the
-    downstream Bedrock turn's payload stays under the model's context
-    window.
+    Strands fires ``AfterToolCallEvent`` once a tool call completes,
+    with ``event.result`` being a mutable ``ToolResult`` mapping. We
+    edit the text content blocks before the next Bedrock turn packages
+    them as conversation history. The MCP server still streams the full
+    response to us — only the executor-conversation copy is bounded, so
+    the downstream Bedrock turn's payload stays under the model's
+    context window.
+
+    The hook is a public-API replacement for the previous subclass-with-
+    ``__getattr__`` wrapper, which depended on the private
+    ``strands.types._events`` module and on tool-attribute names being
+    stable across Strands releases.
     """
-
-    def __init__(self, inner: MCPAgentTool, max_chars: int) -> None:
-        self._inner = inner
-        self._max_chars = max_chars
-
-    def __getattr__(self, item: str) -> Any:
-        # Delegate everything we don't override (tool_name, tool_spec,
-        # tool_type, mcp_tool, mcp_client, etc.) to the wrapped tool.
-        return getattr(self._inner, item)
-
-    async def stream(self, tool_use, invocation_state, **kwargs):
-        async for event in self._inner.stream(tool_use, invocation_state, **kwargs):
-            if isinstance(event, ToolResultEvent):
-                self._truncate_event(event, tool_use)
-            yield event
-
-    def _truncate_event(self, event: ToolResultEvent, tool_use) -> None:
-        result = event.tool_result
-        content_blocks = result.get("content") or []
-        for block in content_blocks:
-            text = block.get("text") if isinstance(block, dict) else None
-            if not isinstance(text, str) or len(text) <= self._max_chars:
-                continue
+    result = event.result
+    content_blocks = result.get("content") or []
+    truncated_any = False
+    for block in content_blocks:
+        text = block.get("text") if isinstance(block, dict) else None
+        if not isinstance(text, str) or len(text) <= _MCP_TOOL_RESULT_MAX_CHARS:
+            continue
+        original_len = len(text)
+        block["text"] = (
+            text[:_MCP_TOOL_RESULT_MAX_CHARS]
+            + f"\n\n[truncated by per-agent: "
+            f"{original_len - _MCP_TOOL_RESULT_MAX_CHARS} of "
+            f"{original_len} chars elided. Issue a narrower query "
+            "(filter, aggregation, projection, or smaller `size`) to "
+            "see more.]"
+        )
+        if not truncated_any:
             tool_name = (
-                tool_use.get("name") if isinstance(tool_use, dict) else None
-            ) or self._inner.tool_name
-            original_len = len(text)
-            block["text"] = (
-                text[: self._max_chars]
-                + f"\n\n[truncated by per-agent: {original_len - self._max_chars} of "
-                f"{original_len} chars elided. Issue a narrower query "
-                "(filter, aggregation, projection, or smaller `size`) to "
-                "see more.]"
-            )
+                event.tool_use.get("name")
+                if isinstance(event.tool_use, dict)
+                else None
+            ) or "tool"
             log_info_event(
                 logger,
                 f"[per] truncated MCP tool result ({tool_name}) from "
-                f"{original_len} to {self._max_chars} chars",
+                f"{original_len} to {_MCP_TOOL_RESULT_MAX_CHARS} chars",
                 "per.mcp_tool_result_truncated",
                 tool_name=tool_name,
                 original_chars=original_len,
-                truncated_chars=self._max_chars,
+                truncated_chars=_MCP_TOOL_RESULT_MAX_CHARS,
             )
+            truncated_any = True
 
 
 def set_mcp_client(mcp_client: MCPClient) -> None:
-    """Resolve and store MCP tools for the execute sub-agent."""
+    """Resolve and store MCP tools for the execute sub-agent.
+
+    Stores raw ``MCPAgentTool`` instances unchanged; oversized tool
+    results are truncated downstream via the ``AfterToolCallEvent`` hook
+    registered in ``build_execute_agent``.
+    """
     global _mcp_tools
-    raw_tools = list(mcp_client.list_tools_sync())
-    _mcp_tools = [_TruncatingMCPTool(t, _MCP_TOOL_RESULT_MAX_CHARS) for t in raw_tools]
+    _mcp_tools = list(mcp_client.list_tools_sync())
     log_info_event(
         logger,
         f"[per] MCP tools resolved for sub-agents ({len(_mcp_tools)} tools, "
@@ -275,6 +244,113 @@ class PlanOutput(BaseModel):
         return _coerce_to_str(v)
 
 
+class BaselineComparison(BaseModel):
+    """Structured relative-deviation evidence for a candidate.
+
+    Domain-neutral: ``candidate_value`` and ``reference_value`` may be
+    latencies, error rates, retry counts, allocation rates, fuel-flow
+    deviations, login frequencies — whatever the active skill defines
+    as a comparable reference. The framework only enforces that the
+    reflector cite a relative comparison rather than an absolute value
+    when finalizing; what to compare and why is the skill's job.
+    """
+
+    candidate_value: str = Field(
+        default="",
+        description=(
+            "The candidate's measured value in the anomaly window. Free "
+            "form so units and qualifiers (e.g., 'p95 1.2s', '47 errors/min') "
+            "fit naturally."
+        ),
+    )
+    reference_value: str = Field(
+        default="",
+        description=(
+            "The comparable reference value the candidate is being judged "
+            "against — typically the same entity's own baseline window, a "
+            "documented spec, or an analogous peer per the active skill's "
+            "ranking criterion. Empty only if no such reference exists; in "
+            "that case the candidate cannot satisfy a finalization gate."
+        ),
+    )
+    deviation_summary: str = Field(
+        default="",
+        description=(
+            "Concise expression of the candidate-to-reference relationship: "
+            "ratio, percentage delta, fold change, or 'pinned at limit in "
+            "both windows'. The framework treats this as the auditable "
+            "summary of why the candidate is named — not just that some "
+            "values were collected."
+        ),
+    )
+
+    @field_validator(
+        "candidate_value", "reference_value", "deviation_summary", mode="before"
+    )
+    @classmethod
+    def _coerce_strs(cls, v):
+        return _coerce_to_str(v)
+
+    def is_populated(self) -> bool:
+        """Whether the comparison has enough content to satisfy a finalize gate."""
+        return bool(
+            self.candidate_value.strip()
+            and self.reference_value.strip()
+            and self.deviation_summary.strip()
+        )
+
+
+class RelatedEntityCheck(BaseModel):
+    """Structured outcome of inspecting entities related to the candidate.
+
+    Domain-neutral generalization of "walk before blaming": when the
+    active skill defines a relation graph (call dependencies, peer
+    accounts, parent/child resources, upstream data sources, etc.),
+    the reflector must have looked at the candidate's related entities
+    and either confirmed no related entity is a stronger fit OR named
+    the related entity that should take its place.
+    """
+
+    entities_examined: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Related entities the reflector inspected for the leading "
+            "candidate (per the active skill's relation graph: dependencies, "
+            "peers, parents, callees, neighbors, etc.). Empty only when no "
+            "candidate is named yet."
+        ),
+    )
+    promotion_made: bool = Field(
+        default=False,
+        description=(
+            "Whether one of the related entities was promoted to "
+            "leading_candidate as a result of the inspection."
+        ),
+    )
+    promoted_to: str = Field(
+        default="",
+        description=(
+            "The related entity that became the new leading_candidate. "
+            "Populated only when ``promotion_made`` is True; empty when "
+            "the inspection confirmed the candidate."
+        ),
+    )
+
+    @field_validator("entities_examined", mode="before")
+    @classmethod
+    def _coerce_list(cls, v):
+        return _coerce_to_str_list(v)
+
+    @field_validator("promoted_to", mode="before")
+    @classmethod
+    def _coerce_str(cls, v):
+        return _coerce_to_str(v)
+
+    def is_populated(self) -> bool:
+        """Whether the check carries enough content to satisfy a finalize gate."""
+        return bool(self.entities_examined)
+
+
 class ReflectOutput(BaseModel):
     """Structured reflector decision.
 
@@ -314,6 +390,31 @@ class ReflectOutput(BaseModel):
         default="",
         description="Same audit-trail discipline as candidate_reason.",
     )
+    candidate_baseline: BaselineComparison = Field(
+        default_factory=BaselineComparison,
+        description=(
+            "Structured relative-deviation evidence for leading_candidate. "
+            "All three sub-fields (candidate_value, reference_value, "
+            "deviation_summary) MUST be populated before finalization; the "
+            "framework rejects any final attribution whose ranking can only "
+            "be defended via absolute magnitude. Domain meaning of "
+            "'reference' (own-baseline / peer / spec) is set by the active "
+            "skill's ranking criterion."
+        ),
+    )
+    related_entities_check: RelatedEntityCheck = Field(
+        default_factory=RelatedEntityCheck,
+        description=(
+            "Structured outcome of inspecting entities related to the "
+            "leading_candidate per the active skill's relation graph "
+            "(dependencies, peers, callees, parents, etc.). "
+            "``entities_examined`` MUST be non-empty before finalization "
+            "so the audit log records that the candidate's neighbors were "
+            "considered, even when no promotion happens. Skip only when "
+            "the active skill explicitly declares no relation graph "
+            "applies to the task."
+        ),
+    )
     outstanding_probes: list[str] = Field(
         default_factory=list,
         description=(
@@ -347,6 +448,25 @@ class ReflectOutput(BaseModel):
             "first principles by asking 'what causal process could produce "
             "this observation?' Empty only when leading_candidate is also "
             "empty (no candidate yet)."
+        ),
+    )
+    mechanism_class: MechanismClass = Field(
+        default=MechanismClass.OTHER,
+        description=(
+            "Discrete classification of `proposed_mechanism` into one of "
+            "the framework-recognised mechanism families. Picking a "
+            "specific class (not 'other') is a COMMITMENT — the finalize "
+            "gate will require at least one [direct] / [deviation] "
+            "KNOWN_FACT carrying a discriminator token for that class. "
+            "The discriminator vocabulary is the field-name / log-keyword "
+            "set that the corresponding ppl-probes probe template "
+            "produces. Pick 'other' when the active domain skill defines "
+            "a mechanism this taxonomy does not yet cover; do NOT pick "
+            "'other' merely to bypass the discriminator gate. Available "
+            "values: network-loss, socket-exhaustion, disk-io-saturation, "
+            "cpu-compute-saturation, memory-pressure, gc-pause, "
+            "lock-contention, dependency-degradation, injected-delay, "
+            "other."
         ),
     )
     mechanism_alternatives: list[str] = Field(
@@ -609,16 +729,17 @@ Critical rules:
 1. NEVER repeat a step that has already been completed. Completed steps are listed in the "Completed steps (summary)" section of your input. Their KNOWN_FACTS have already been captured and are available to you.
 2. NEVER re-issue a hypothesis that has already been ruled out by KNOWN_FACTS (e.g., do not propose using a field that facts say is null/absent; do not propose a tool path that facts say doesn't exist). Do NOT echo or restate the original plan in your output — it is informational context, not output. (See response header: exactly one of `next_steps` / `result` non-empty per turn.)
 3. SCOPE COVERAGE BEFORE FINALIZE — every plan step, every enumerated item inside a plan step, every `[symptom]` fact, every skill-defined investigation dimension, and every named direct indicator must be either (a) actively probed and resolved by KNOWN_FACTS, or (b) explicitly invalidated by a citing KNOWN_FACT (record in `dimensions_invalidated`). Anything still pending lives in `outstanding_probes`; finalize only when that list is empty (for items touching the leading candidate). Silently dropping plan steps, enumerated subsets, parked symptoms, or expected dimensions is the most common path to mis-classified mechanism.
-4. WALK BEFORE BLAMING — before attributing the leading_candidate's deviation to a different entity (a dependency, a parent/child, a neighbor, an upstream resource), you MUST first verify the candidate's own signals have been probed (visible in QUERIES_EXECUTED), AND walk the candidate's relation graph (dependencies, callees, parents/children — whatever the domain provides) checking whether a related entity shows a stronger relative deviation that should take its place. Record the walk's outcome explicitly in `candidate_reason`. An entity that is merely NAMED in symptom text is NOT automatically the cause — the cause is the entity whose OWN signals exhibit the anomalous pattern.
-5. RANK BY RELATIVE DEVIATION, BACK BY DIRECT EVIDENCE — rank candidates by how far each entity's measurement has moved relative to its own baseline / comparable reference, not by absolute magnitude across entities. A small absolute change can be a large relative deviation; a large absolute number that matches the entity's own normal is NOT anomalous. `result` may only be populated when every entity named in the conclusion is supported by at least one `[direct]` KNOWN_FACT; symptom-only attribution is forbidden. Apparent improvement (a counter falling, a signal disappearing) is itself a signal — stall, silent failure, throttling, or measurement loss may explain it; do not treat improvement as exoneration without an active probe with a comparable reference.
-6. MECHANISM — `proposed_mechanism` must name a CAUSAL PROCESS, not an observation; an exception class, metric label, or anomaly name describes WHAT was observed, not WHY. Restate as "<process> in <candidate> produces <observed symptoms> via <pathway>" and verify it explains every parked symptom and direct fact, not just the loudest. `mechanism_alternatives` MUST contain at least 2 entries when `proposed_mechanism` is set — for each, either cite the KNOWN_FACT that falsifies it or state why it remains plausible-but-ranked-below. Symmetric / fingerprint-equivalent mechanisms (different processes producing identical observations — most often demand-side vs supply-side dualities) MUST appear here, since naming them forces you to identify the discriminating evidence rather than rely on availability bias. `mechanism_evidence` must include at least one `[direct]` or `[deviation]` fact.
+4. WALK BEFORE BLAMING — before attributing the leading_candidate's deviation to a different entity, you MUST first verify the candidate's own signals have been probed (visible in QUERIES_EXECUTED), AND walk the candidate's relation graph as defined by the active domain skill (dependencies, callees, parents/children, peers, upstream resources — whatever the skill specifies; if no skill applies, derive a relation graph from the data itself) checking whether a related entity shows a stronger relative deviation that should take its place. Record the walk's outcome in the `related_entities_check` field — list every related entity examined, set `promotion_made` and `promoted_to` if you reassign the leading candidate. An entity that is merely NAMED in symptom text is NOT automatically the cause — the cause is the entity whose OWN signals exhibit the anomalous pattern.
+5. RANK BY RELATIVE DEVIATION, BACK BY DIRECT EVIDENCE — rank candidates by how far each entity's measurement has moved relative to a comparable reference (its own baseline, a peer, or a documented spec — the active skill defines which), not by absolute magnitude across entities. A small absolute change can be a large relative deviation; a large absolute number that matches the entity's own normal is NOT anomalous. Record the relative-deviation evidence in the `candidate_baseline` field — `candidate_value`, `reference_value`, and `deviation_summary` MUST all be populated before finalizing. `result` may only be populated when every entity named in the conclusion is supported by at least one `[direct]` KNOWN_FACT; symptom-only attribution is forbidden. Apparent improvement (a counter falling, a signal disappearing) is itself a signal — stall, silent failure, throttling, or measurement loss may explain it; do not treat improvement as exoneration without an active probe with a comparable reference.
+6. MECHANISM — `proposed_mechanism` must name a CAUSAL PROCESS, not an observation; an exception class, metric label, or anomaly name describes WHAT was observed, not WHY. Restate as "<process> in <candidate> produces <observed symptoms> via <pathway>" and verify it explains every parked symptom and direct fact, not just the loudest. `mechanism_alternatives` MUST contain at least 2 entries when `proposed_mechanism` is set — for each, either cite the KNOWN_FACT that falsifies it or state why it remains plausible-but-ranked-below. Symmetric / fingerprint-equivalent mechanisms (different causal processes that produce identical observations) MUST appear here when the active domain skill names such pairs (the skill is the authoritative source for which dualities apply to your domain — supply/demand for performance work, intent/incident for security work, etc.); when no skill applies, derive at least one such pair from first principles by asking "what other process would have produced the same observation?". `mechanism_evidence` must include at least one `[direct]` or `[deviation]` fact.
+   MECHANISM CLASS COMMITMENT — `mechanism_class` selects one of the framework-recognised mechanism families (network-loss, socket-exhaustion, disk-io-saturation, cpu-compute-saturation, memory-pressure, gc-pause, lock-contention, dependency-degradation, injected-delay, other). Picking a specific class commits you to producing at least one `[direct]` / `[deviation]` KNOWN_FACT whose body cites a DISCRIMINATOR token for that class — the field name or log fragment that distinguishes it from its near-twins. The discriminator vocabulary is the field-name / log-keyword set produced by the corresponding probe template in the `ppl-probes` skill (activate it once you commit to a class); the orchestrator's finalize gate enforces this match programmatically. Examples: declaring `network-loss` requires a fact mentioning `packets_dropped`, `tcp_retransmit`, `RTO`, `connection reset`, or a bimodal-at-RTO-multiples latency shape; declaring `disk-io-saturation` requires a fact mentioning `fs_io_time`, `iowait`, `fsync`, `ENOSPC`, or `EIO`; declaring `cpu-compute-saturation` requires `cfs_throttled`, throttled-seconds, run-queue depth, or a per-request CPU-time delta — a raw "CPU is high" fact does NOT discriminate from iowait spinning, busy-wait, or GC thrash and will be rejected. If the active domain skill defines a mechanism this taxonomy does not cover, set `mechanism_class` to `other`; do NOT pick `other` to bypass the discriminator gate when a registered class fits.
 7. PREFER COMPUTABLE INVARIANTS OVER NARRATIVE — when the active domain skill defines computable invariants (quantities that should hold equal, sum to a known total, conserve across boundaries, etc.), check at least one before finalizing and record the result in `mechanism_evidence`. Invariants are stronger evidence than narrative because they are mechanically falsifiable: a violated invariant is a direct mechanism signature. Where the skill is silent, derive an invariant from first principles (conservation, monotonicity, rate-limiting bounds) before defaulting to narrative explanation.
 8. Finalize with `result` only when rules 3–7 are ALL satisfied AND the cumulative evidence answers the objective. Premature finalization on a partial picture is the single most common failure mode of this pipeline — actively guard against it.
 
 Important rules for the response:
 1. Call the structured-output tool with all fields populated per the field semantics above.
 2. Do not produce free-form text outside of the structured-output tool call.
-3. The `result` field is the deliverable for the user when the investigation finishes — write it as a comprehensive markdown report (lists, headings, code blocks fine; just escape backslashes and quotes as JSON requires).
+3. The `result` field is the deliverable for the user when the investigation finishes — write it as a comprehensive markdown report (lists, headings, code blocks all fine). Do NOT manually escape backslashes or quotes; Strands' structured-output layer handles JSON encoding for you, so escape characters you write yourself end up double-escaped in the final output.
 
 """
 
@@ -660,12 +781,26 @@ PLANNER_SYSTEM_PROMPT = (
     f"{PLAN_EXECUTE_REFLECT_RESPONSE_FORMAT}"
 )
 
-# Reflect: shares planner responsibility prose because its decision
-# language is plan-shaped, but receives FINAL_RESULT_RESPONSE_INSTRUCTIONS
-# because reflect is the phase that actually produces the final report.
+# Reflect: a slim "step grammar" preamble (a 4-line summary of the
+# planner's step rules so reflect-emitted next_steps remain shaped like
+# planner output) plus the reflect-specific response format and the
+# final-result instructions. The full PLANNER_RESPONSIBILITY used to be
+# inlined here, but its plan-construction rules (Phase A enumeration,
+# meta-step ban, "use only provided tools") cost ~3K tokens per reflect
+# call without affecting reflect-time decisions — reflect doesn't build
+# plans from scratch, it audits + re-dispatches.
+REFLECT_STEP_GRAMMAR_SUMMARY = (
+    "When you emit `next_steps`, each entry must be ONE atomic, "
+    "self-contained step (no commas separating sub-tasks, no "
+    "meta-steps like 'reason over results' or 'compile final report'). "
+    "Reference only tools that are actually available; cite specific "
+    "data sources, indices, or parameters; never compress multiple "
+    "distinct probes into a single entry. Defer to the active domain "
+    "skill for what counts as one atomic step in this domain."
+)
 REFLECT_SYSTEM_PROMPT = (
     f"{PROMPT_TEMPLATE_PREFIX}\n\n"
-    f"{PLANNER_RESPONSIBILITY}\n\n"
+    f"{REFLECT_STEP_GRAMMAR_SUMMARY}\n\n"
     f"{REFLECT_RESPONSE_FORMAT}\n\n"
     f"{FINAL_RESULT_RESPONSE_INSTRUCTIONS}"
 )
@@ -678,6 +813,19 @@ EXECUTOR_SYSTEM_PROMPT = (
 
 
 _MAX_OUTPUT_TOKENS = 32768
+
+# Bedrock no longer accepts the ``temperature`` parameter for newer
+# Claude inference profiles (Opus 4.x / Sonnet 4.x emit
+# "ValidationException: `temperature` is deprecated for this model").
+# We previously set 0.1 for planner/reflector and 0.4 for executor;
+# both were rejected outright by ConverseStream. Until Bedrock exposes
+# a replacement sampling control we omit ``temperature`` entirely and
+# rely on the model's default.
+#
+# If you are deploying to an OLDER inference profile that still
+# accepts ``temperature``, opt back in by setting the env var
+# ``PER_BEDROCK_TEMPERATURE`` — ``_model()`` only passes the parameter
+# when the env var is set, so the default deployment stays clean.
 
 # Bedrock-runtime read timeout in seconds. Strands' default (120s, see
 # DEFAULT_READ_TIMEOUT in strands.models.bedrock) is fine in steady state
@@ -700,7 +848,12 @@ _BEDROCK_CONNECT_TIMEOUT_SECONDS = 10
 _BEDROCK_MAX_RETRIES = 3
 
 
-def _model(*, cache_tools: bool = False, model_id_env: str | None = None) -> BedrockModel:
+def _model(
+    *,
+    cache_tools: bool = False,
+    model_id_env: str | None = None,
+    temperature: float | None = None,
+) -> BedrockModel:
     # Prompt-caching strategy:
     #   - For the executor: ``cache_tools="default"`` injects a cache point
     #     at the end of the tool schema block. Bedrock caches the prefix up
@@ -748,6 +901,20 @@ def _model(*, cache_tools: bool = False, model_id_env: str | None = None) -> Bed
         "max_tokens": _MAX_OUTPUT_TOKENS,
         "cache_config": CacheConfig(strategy="auto"),
     }
+    # ``temperature`` is opt-in. Newer Claude inference profiles on
+    # Bedrock reject the parameter outright ("ValidationException:
+    # `temperature` is deprecated for this model"). Caller passes a
+    # value (or sets ``PER_BEDROCK_TEMPERATURE``) only when targeting
+    # an older profile that still accepts it.
+    if temperature is None:
+        env_temp = os.getenv("PER_BEDROCK_TEMPERATURE")
+        if env_temp is not None:
+            try:
+                temperature = float(env_temp)
+            except ValueError:
+                temperature = None
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     if cache_tools:
         kwargs["cache_tools"] = "default"
     return BedrockModel(**kwargs)
@@ -837,7 +1004,10 @@ def build_execute_agent() -> Agent:
     # (``BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN``) that defaults back to
     # ``BEDROCK_INFERENCE_PROFILE_ARN`` when unset.
     agent = Agent(
-        model=_model(cache_tools=True, model_id_env="BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN"),
+        model=_model(
+            cache_tools=True,
+            model_id_env="BEDROCK_EXECUTOR_INFERENCE_PROFILE_ARN",
+        ),
         system_prompt=EXECUTOR_SYSTEM_PROMPT,
         tools=list(_mcp_tools),
         plugins=_skills_plugin(),
@@ -846,6 +1016,7 @@ def build_execute_agent() -> Agent:
     agent.hooks.add_callback(
         BeforeToolCallEvent, _ToolCallLimiter(_EXECUTOR_TOOL_CALL_HARD_CAP)
     )
+    agent.hooks.add_callback(AfterToolCallEvent, _truncate_tool_result_hook)
     return agent
 
 

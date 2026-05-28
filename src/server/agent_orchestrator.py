@@ -17,6 +17,8 @@ from typing import Any
 from ag_ui.core import RunAgentInput
 from ag_ui_strands import StrandsAgent as AGUIStrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig
+from opentelemetry import trace as _otel_trace
+from opentelemetry.trace import StatusCode as _OtelStatusCode
 from strands import Agent as StrandsAgentCore
 
 from orchestrator.router import PageContextRouter
@@ -24,6 +26,8 @@ from utils.logging_helpers import get_logger, log_debug_event, log_info_event
 from utils.obo_context import OboAuth
 
 logger = get_logger(__name__)
+
+_tracer = _otel_trace.get_tracer("opensearch-agent-server")
 
 # A factory callable that returns a pre-configured Strands Agent.
 # Headers are no longer passed to the factory — OboAuth handles auth.
@@ -236,5 +240,17 @@ class AgentOrchestrator:
         if obo_auth is not None:
             obo_auth.set_token(token)
 
-        async for event in agui_agent.run(input_data):
-            yield event
+        with _tracer.start_as_current_span("invoke_agent") as root_span:
+            root_span.set_attribute("gen_ai.operation.name", "invoke_agent")
+            root_span.set_attribute("gen_ai.agent.name", agent_name)
+            root_span.set_attribute("gen_ai.system", "aws.bedrock")
+            if input_data.run_id:
+                root_span.set_attribute("gen_ai.request.id", input_data.run_id)
+            if input_data.thread_id:
+                root_span.set_attribute("gen_ai.conversation.id", input_data.thread_id)
+            try:
+                async for event in agui_agent.run(input_data):
+                    yield event
+            except Exception as exc:
+                root_span.set_status(_OtelStatusCode.ERROR, str(exc))
+                raise

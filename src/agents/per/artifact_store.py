@@ -220,6 +220,50 @@ class ArtifactStore:
         )
         return "\n".join(kept_lines)
 
+    def all_schema_facts(self, max_recent: int | None = None) -> str:
+        """Render ``[schema]``-tagged AND unclassified facts with optional LRU cap.
+
+        Schema facts (field presence / units / naming conventions / query
+        constraints) are operationally critical — they prevent the next
+        executor from rediscovering the same gotcha — but they are
+        WORM-shaped: once recorded, the truth doesn't change. Older
+        schema discoveries past the working set become dead weight in
+        every reflect prompt for the rest of the run.
+
+        ``max_recent`` (when set) keeps only the most recent N schema
+        facts and collapses older ones into a single ``- (… N earlier
+        schema facts elided)`` line so the reflector knows they exist
+        without paying their token cost.
+
+        We treat any fact that is NOT tagged ``[direct]`` / ``[symptom]``
+        / ``[deviation]`` as schema-class for elision purposes. The
+        executor system prompt requires every fact to carry a tag; an
+        un-tagged or oddly-tagged fact is closer in semantics to schema
+        (an artifact of execution, not a hypothesis) than to anything
+        else.
+        """
+        if not self._artifacts:
+            return ""
+        keep_prefixes = ("[direct]", "[symptom]", "[deviation]")
+        lines: list[str] = []
+        for artifact in self._artifacts:
+            for fact in artifact.facts:
+                lc = fact.lower().lstrip()
+                if lc.startswith(keep_prefixes):
+                    continue
+                lines.append(f"- [{artifact.id}] {fact}")
+        if max_recent is None or len(lines) <= max_recent:
+            return "\n".join(lines)
+        elided = len(lines) - max_recent
+        kept = lines[-max_recent:]
+        return "\n".join(
+            [
+                f"- (… {elided} earlier schema fact(s) elided to bound prompt "
+                "size; kept: most recent)"
+            ]
+            + kept
+        )
+
     def has_direct_fact_for(self, candidate: str) -> bool:
         """Whether any ``[direct]`` fact mentions the candidate component.
 
