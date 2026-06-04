@@ -13,32 +13,20 @@ import boto3
 import httpx
 from mcp.client.streamable_http import streamable_http_client
 from strands import Agent, AgentSkills, Skill
-from strands.models import BedrockModel
+from strands.models.bedrock import BedrockModel
+from strands.models.model import CacheConfig
 from strands.tools.mcp import MCPClient
 
 from server.constants import DEFAULT_MCP_SERVER_URL
 from utils.logging_helpers import get_logger, log_info_event
 from utils.obo_context import OboAuth
 
-logger = get_logger(__name__)
-
-# Default Bedrock model — same as Strands SDK default.
-# Used when BEDROCK_INFERENCE_PROFILE_ARN is not explicitly set.
+# Fallback model when ``BEDROCK_DEFAULT_AGENT_MODEL_ARN`` is unset.
+# Mirrors the PER agent's fallback so a misconfigured deployment
+# behaves consistently across agents.
 _DEFAULT_BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 
-
-def _get_aws_session() -> boto3.Session:
-    """Create a boto3 session using the default AWS credential provider chain."""
-    return boto3.Session()
-
-
-def _create_default_agent_model(inference_profile_arn: str) -> BedrockModel:
-    """Create a BedrockModel for the default agent."""
-    return BedrockModel(
-        model_id=inference_profile_arn,
-        boto_session=_get_aws_session(),
-        streaming=True,
-    )
+logger = get_logger(__name__)
 
 
 class LoggingAgentSkills(AgentSkills):
@@ -192,22 +180,37 @@ def create_default_agent(opensearch_url: str) -> Agent:
             skill_names=[s.name for s in skills],
         )
 
-    # Read Bedrock inference profile from env var, falling back to Strands default.
-    # Using a local variable (not os.environ mutation) — the default agent has no
-    # sub-agents that need to observe this fallback.
-    inference_profile_arn = os.getenv(
-        "BEDROCK_INFERENCE_PROFILE_ARN", _DEFAULT_BEDROCK_MODEL_ID
-    )
-    log_info_event(
-        logger,
-        f"Default agent using Bedrock inference profile: {inference_profile_arn}",
-        "default_agent.bedrock_model",
-        inference_profile_arn=inference_profile_arn,
+    # Bedrock model with prompt caching enabled. ``cache_tools="default"``
+    # injects a cache breakpoint right after the tool schema, which
+    # implicitly covers the system prompt (everything before the
+    # breakpoint becomes the cached prefix). ``cache_config(strategy=
+    # "auto")`` lets Strands also place breakpoints inside the
+    # conversation so large tool results — e.g. an OpenSearch
+    # ``SearchIndexTool`` response of ~250K tokens — are paid for once
+    # and read from cache on every subsequent turn at ~10% of the input
+    # price. Without this, a 22-turn investigation re-bills every prior
+    # tool result on every turn; we observed cases consuming >1M input
+    # tokens for that reason.
+    #
+    # Model ID resolution: read ``BEDROCK_INFERENCE_PROFILE_ARN`` —
+    # the same env var the PER planner / reflector reads — so both
+    # agents run on the same inference profile by default. Falls back
+    # to the bundled default when the env is unset.
+    # ``temperature`` is deliberately omitted — newer Claude inference
+    # profiles on Bedrock reject the parameter.
+    model_id = os.getenv("BEDROCK_INFERENCE_PROFILE_ARN") or _DEFAULT_BEDROCK_MODEL_ID
+    bedrock_model = BedrockModel(
+        model_id=model_id,
+        boto_session=boto3.Session(),
+        streaming=True,
+        max_tokens=32768,
+        cache_tools="default",
+        cache_config=CacheConfig(strategy="auto"),
     )
 
     # Create agent with MCP tools and skills plugin
     agent = Agent(
-        model=_create_default_agent_model(inference_profile_arn),
+        model=bedrock_model,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         tools=tools,
         plugins=plugins,
@@ -222,11 +225,13 @@ def create_default_agent(opensearch_url: str) -> Agent:
     log_info_event(
         logger,
         f"Default agent initialized with {tool_count} MCP tools "
-        f"(server={mcp_server_url}).",
+        f"(server={mcp_server_url}, model={model_id}, prompt_cache=on).",
         "default_agent.initialized",
         tool_count=tool_count,
         mcp_server_url=mcp_server_url,
         opensearch_url=opensearch_url,
+        model_id=model_id,
+        prompt_cache=True,
     )
 
     return agent

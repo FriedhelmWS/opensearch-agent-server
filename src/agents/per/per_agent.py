@@ -50,6 +50,7 @@ from server.constants import DEFAULT_MCP_SERVER_URL
 from utils.logging_helpers import get_logger, log_info_event, log_warning_event
 from utils.monitored_tool import monitored_tool
 from utils.obo_context import OboAuth
+from utils.token_usage_context import publish_inner_usage
 
 logger = get_logger(__name__)
 
@@ -344,6 +345,25 @@ def _usage_tokens(result) -> tuple[int, int]:
     return int(usage.get("inputTokens", 0)), int(usage.get("outputTokens", 0))
 
 
+def _full_usage(result) -> dict[str, int]:
+    """Pull the full Bedrock usage record off an ``AgentResult``.
+
+    Returns input / output plus cache read / write tokens. The cache
+    fields are produced by Bedrock when prompt caching is in effect (PER
+    sub-agents enable it via ``cache_tools`` / ``cache_config``). Without
+    them, downstream token accounting under-counts cached prefixes.
+    """
+    usage = getattr(getattr(result, "metrics", None), "accumulated_usage", None)
+    if not usage:
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    return {
+        "input": int(usage.get("inputTokens", 0)),
+        "output": int(usage.get("outputTokens", 0)),
+        "cache_read": int(usage.get("cacheReadInputTokens", 0)),
+        "cache_write": int(usage.get("cacheWriteInputTokens", 0)),
+    }
+
+
 def _build_reflect_input(
     objective: str,
     plan_steps: list[str],
@@ -448,11 +468,20 @@ def _build_execute_input(step: str, artifacts: ArtifactStore) -> str:
 
 
 async def _run_phase(agent: Agent, prompt: str, phase: str, step_index: int):
-    """Invoke a sub-agent and log timing + token usage for the phase."""
+    """Invoke a sub-agent and log timing + token usage for the phase.
+
+    The fifth return slot is the full usage dict (input / output /
+    cache_read / cache_write). The first four slots stay
+    ``(result, elapsed_ms, tokens_in, tokens_out)`` so existing call
+    sites that destructure the tuple keep working — only the pipeline's
+    accumulator looks at slot 5.
+    """
     started = time.perf_counter()
     result = await agent.invoke_async(prompt)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    tokens_in, tokens_out = _usage_tokens(result)
+    usage = _full_usage(result)
+    tokens_in = usage["input"]
+    tokens_out = usage["output"]
     log_info_event(
         logger,
         f"[per] {phase} phase complete (step {step_index})",
@@ -462,8 +491,10 @@ async def _run_phase(agent: Agent, prompt: str, phase: str, step_index: int):
         elapsed_ms=elapsed_ms,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cache_read_tokens=usage["cache_read"],
+        cache_write_tokens=usage["cache_write"],
     )
-    return result, elapsed_ms, tokens_in, tokens_out
+    return result, elapsed_ms, tokens_in, tokens_out, usage
 
 
 def create_per_agent(opensearch_url: str) -> Agent:
@@ -531,6 +562,65 @@ def create_per_agent(opensearch_url: str) -> Agent:
         artifacts = ArtifactStore()
         pipeline_started = time.perf_counter()
 
+        # Accumulator for Bedrock-reported token usage across every
+        # sub-agent call this pipeline makes (plan + each reflect + each
+        # executor sub-agent + their nested tool-use turns). Sub-agent
+        # traffic is invisible to the outer orchestrator's
+        # ``event_loop_metrics.accumulated_usage``; without this the
+        # CustomEvent emitted by the orchestrator under-counts the PER
+        # pipeline by ~40×. Two views are maintained:
+        #   - top-level totals (input / output / cache_read / cache_write)
+        #   - by_phase breakdown (plan / execute / reflect, with call counts)
+        # ``_publish`` is wired into every return path so the
+        # ContextVar handoff to the orchestrator never gets skipped.
+        usage_totals = {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "phase_calls": 0,
+            "by_phase": {
+                "plan": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
+                "execute": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
+                "reflect": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
+            },
+        }
+
+        def _accumulate(usage: dict, phase: str) -> None:
+            for k in ("input", "output", "cache_read", "cache_write"):
+                usage_totals[k] += int(usage.get(k, 0))
+            usage_totals["phase_calls"] += 1
+            bucket = usage_totals["by_phase"].setdefault(
+                phase, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
+            )
+            for k in ("input", "output", "cache_read", "cache_write"):
+                bucket[k] += int(usage.get(k, 0))
+            bucket["calls"] += 1
+
+        def _publish() -> None:
+            denom = usage_totals["input"] + usage_totals["cache_read"] + usage_totals["cache_write"]
+            cache_hit_ratio = (
+                round(usage_totals["cache_read"] / denom, 4) if denom else 0.0
+            )
+            # ``publish_inner_usage`` MUTATES the orchestrator-installed
+            # container in place — calling ``ContextVar.set`` here would
+            # rebind only inside Strands' per-tool context copy and the
+            # orchestrator would never see it (this is the bug that made
+            # earlier runs report inner={0,0,0,0} despite the pipeline
+            # actually spending 5K+ tokens per request).
+            publish_inner_usage(
+                {
+                    "schema_version": 1,
+                    "input": usage_totals["input"],
+                    "output": usage_totals["output"],
+                    "cache_read": usage_totals["cache_read"],
+                    "cache_write": usage_totals["cache_write"],
+                    "cache_hit_ratio": cache_hit_ratio,
+                    "phase_calls": usage_totals["phase_calls"],
+                    "by_phase": usage_totals["by_phase"],
+                }
+            )
+
         log_info_event(
             logger,
             "[per] pipeline start",
@@ -540,9 +630,10 @@ def create_per_agent(opensearch_url: str) -> Agent:
 
         # ---- Plan phase --------------------------------------------------
         plan_agent = build_plan_agent()
-        plan_result, _, _, _ = await _run_phase(
+        plan_result, _, _, _, plan_usage = await _run_phase(
             plan_agent, problem_statement, "plan", step_index=0
         )
+        _accumulate(plan_usage, "plan")
         plan_steps, plan_final = _parse_planner_output(str(plan_result))
 
         if plan_final:
@@ -553,6 +644,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 "per.pipeline.early_finish",
                 phase="plan",
             )
+            _publish()
             return plan_final
 
         if not plan_steps:
@@ -561,6 +653,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 "[per] planner emitted no steps and no result; aborting",
                 "per.pipeline.empty_plan",
             )
+            _publish()
             return f"Planner produced no actionable plan.\n\nRaw output:\n{plan_result}"
 
         # ---- Execute / Reflect loop -------------------------------------
@@ -606,7 +699,8 @@ def create_per_agent(opensearch_url: str) -> Agent:
             )
 
             for i, (step_text, outcome) in enumerate(zip(batch, exec_outcomes)):
-                exec_result, exec_ms, exec_in, exec_out = outcome
+                exec_result, exec_ms, exec_in, exec_out, exec_usage = outcome
+                _accumulate(exec_usage, "execute")
                 step_index = steps_executed + 1 + i
                 raw_findings = str(exec_result)
                 findings, queries, facts = _extract_sections(raw_findings)
@@ -649,9 +743,10 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 artifacts=artifacts,
                 latest_n=batch_size,
             )
-            reflect_result, _, _, _ = await _run_phase(
+            reflect_result, _, _, _, reflect_usage = await _run_phase(
                 reflect_agent, reflect_prompt, "reflect", steps_executed
             )
+            _accumulate(reflect_usage, "reflect")
             last_reflect_text = str(reflect_result)
             next_steps, final_result = _parse_reflect_output(last_reflect_text)
 
@@ -664,6 +759,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
                     steps_executed=steps_executed,
                     total_elapsed_ms=total_ms,
                 )
+                _publish()
                 return final_result
 
             if not next_steps:
@@ -685,6 +781,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
             "per.pipeline.max_steps",
             max_steps=_MAX_STEPS,
         )
+        _publish()
         return (
             f"Max Steps Limit ({_MAX_STEPS}) Reached. Use the same conversation "
             f"to continue.\n\nLast reflection:\n{last_reflect_text or '(no reflection)'}"

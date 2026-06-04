@@ -14,7 +14,7 @@ import json
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from ag_ui.core import RunAgentInput
+from ag_ui.core import CustomEvent, EventType, RunAgentInput
 from ag_ui_strands import StrandsAgent as AGUIStrandsAgent
 from ag_ui_strands.config import StrandsAgentConfig
 from strands import Agent as StrandsAgentCore
@@ -22,6 +22,12 @@ from strands import Agent as StrandsAgentCore
 from orchestrator.router import PageContextRouter
 from utils.logging_helpers import get_logger, log_debug_event, log_info_event
 from utils.obo_context import OboAuth
+from utils.token_usage_context import (
+    get_inner_usage,
+    inner_usage_is_present,
+    install_inner_usage_container,
+    uninstall_inner_usage_container,
+)
 
 logger = get_logger(__name__)
 
@@ -236,5 +242,121 @@ class AgentOrchestrator:
         if obo_auth is not None:
             obo_auth.set_token(token)
 
-        async for event in agui_agent.run(input_data):
-            yield event
+        # Install a SHARED MUTABLE container for the inner-pipeline
+        # usage. The pipeline (running inside Strands' per-tool context
+        # copy) mutates this dict instead of rebinding the ContextVar —
+        # rebinding inside a child context would not propagate back to
+        # us. See ``utils.token_usage_context`` for the full rationale.
+        usage_token = install_inner_usage_container()
+        outer_before = _outer_accumulated_usage(agui_agent, input_data.thread_id)
+        try:
+            # Hold the terminal RunFinishedEvent so we can splice in a
+            # ``CustomEvent`` carrying the run's full token usage right
+            # before the run closes — that ordering lets clients receive
+            # usage in-band on the same SSE stream without a second
+            # request.
+            pending_finished = None
+            async for event in agui_agent.run(input_data):
+                if getattr(event, "type", None) == EventType.RUN_FINISHED:
+                    pending_finished = event
+                    continue
+                yield event
+            outer_after = _outer_accumulated_usage(agui_agent, input_data.thread_id)
+            inner_payload = get_inner_usage() if inner_usage_is_present() else None
+            token_usage_event = _build_token_usage_event(
+                agent_name=agent_name,
+                outer_before=outer_before,
+                outer_after=outer_after,
+                inner=inner_payload,
+            )
+            if token_usage_event is not None:
+                yield token_usage_event
+            if pending_finished is not None:
+                yield pending_finished
+        finally:
+            uninstall_inner_usage_container(usage_token)
+
+
+def _outer_accumulated_usage(
+    agui_agent: AGUIStrandsAgent, thread_id: str
+) -> dict[str, int]:
+    """Snapshot the outer Strands agent's accumulated token usage.
+
+    Each thread keeps its own ``StrandsAgentCore`` inside
+    ``ag_ui_strands.StrandsAgent``; that core's
+    ``event_loop_metrics.accumulated_usage`` accumulates across every
+    request on the thread. Snapshot before / after the run and subtract
+    to attribute usage to *this* run only.
+
+    Returns zeros if the agent or its metrics are not yet materialized
+    (the per-thread agent is created lazily on first request, so the
+    "before" snapshot of a brand-new thread has nothing to read).
+    """
+    agents_by_thread = getattr(agui_agent, "_agents_by_thread", {}) or {}
+    core = agents_by_thread.get(thread_id)
+    metrics = getattr(core, "event_loop_metrics", None) if core is not None else None
+    usage = getattr(metrics, "accumulated_usage", None) if metrics is not None else None
+    if not usage:
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    return {
+        "input": int(usage.get("inputTokens", 0)),
+        "output": int(usage.get("outputTokens", 0)),
+        "cache_read": int(usage.get("cacheReadInputTokens", 0)),
+        "cache_write": int(usage.get("cacheWriteInputTokens", 0)),
+    }
+
+
+def _build_token_usage_event(
+    *,
+    agent_name: str,
+    outer_before: dict[str, int],
+    outer_after: dict[str, int],
+    inner: dict[str, Any] | None,
+) -> CustomEvent | None:
+    """Build the ``token_usage`` CustomEvent emitted before RUN_FINISHED.
+
+    The outer agent's contribution is the delta of its accumulated
+    counters across this run. The inner contribution (currently only
+    published by the PER pipeline) is added on top so the event reports
+    every Bedrock token spent on behalf of the user — including
+    sub-agent calls that never surface as outer SSE events.
+
+    Returns ``None`` only when no metrics were captured at all (e.g. an
+    agent type that hasn't run any LLM calls yet); callers fall back to
+    plain RUN_FINISHED in that case.
+    """
+    outer_delta = {
+        k: max(0, outer_after.get(k, 0) - outer_before.get(k, 0))
+        for k in ("input", "output", "cache_read", "cache_write")
+    }
+    inner_normalized = {
+        "input": int((inner or {}).get("input", 0)),
+        "output": int((inner or {}).get("output", 0)),
+        "cache_read": int((inner or {}).get("cache_read", 0)),
+        "cache_write": int((inner or {}).get("cache_write", 0)),
+    }
+    total = {
+        k: outer_delta[k] + inner_normalized[k]
+        for k in ("input", "output", "cache_read", "cache_write")
+    }
+    if all(v == 0 for v in total.values()):
+        return None
+    value: dict[str, Any] = {
+        "schema_version": 1,
+        "agent": agent_name,
+        "input": total["input"],
+        "output": total["output"],
+        "cache_read": total["cache_read"],
+        "cache_write": total["cache_write"],
+        "outer": outer_delta,
+        "inner": inner_normalized,
+    }
+    # Forward the PER pipeline's per-phase / cache-hit breakdown when
+    # present — runners that only want the headline four numbers can
+    # ignore these, while ones that care about plan-vs-execute cost get
+    # the full picture without scraping HTML comments out of the report.
+    if inner:
+        for key in ("by_phase", "phase_calls", "cache_hit_ratio", "per_round"):
+            if key in inner:
+                value[key] = inner[key]
+    return CustomEvent(type=EventType.CUSTOM, name="token_usage", value=value)
