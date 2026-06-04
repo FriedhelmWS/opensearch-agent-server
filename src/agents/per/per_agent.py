@@ -57,10 +57,6 @@ from strands.models.model import CacheConfig
 from strands.tools.mcp import MCPClient
 
 from agents.per.artifact_store import ArtifactStore
-from agents.per.mechanism_discriminators import (
-    MechanismClass,
-    discriminator_violations,
-)
 from agents.per.sub_agents import (
     BaselineComparison,
     PlanOutput,
@@ -252,7 +248,6 @@ class ReflectDecision:
     related_entities_check: RelatedEntityCheck = field(default_factory=RelatedEntityCheck)
     outstanding_probes: list[str] = field(default_factory=list)
     proposed_mechanism: str = ""
-    mechanism_class: MechanismClass = MechanismClass.OTHER
     mechanism_alternatives: list[str] = field(default_factory=list)
     mechanism_evidence: list[str] = field(default_factory=list)
     dimensions_invalidated: list[str] = field(default_factory=list)
@@ -286,7 +281,6 @@ def _reflect_decision_from_result(result) -> ReflectDecision:
         related_entities_check=so.related_entities_check or RelatedEntityCheck(),
         outstanding_probes=_clean_list(so.outstanding_probes),
         proposed_mechanism=(so.proposed_mechanism or "").strip(),
-        mechanism_class=so.mechanism_class or MechanismClass.OTHER,
         mechanism_alternatives=_clean_list(so.mechanism_alternatives),
         mechanism_evidence=_clean_list(so.mechanism_evidence),
         dimensions_invalidated=_clean_list(so.dimensions_invalidated),
@@ -345,12 +339,12 @@ def _extract_sections(findings: str) -> tuple[str, list[str], list[str]]:
 # Finalize-gate violation severity. ``critical`` violations are
 # evidence-quality checks whose failure means the finalize is unsound
 # regardless of how long the run has gone (e.g., naming a candidate with
-# no [direct] fact, claiming a mechanism class without its discriminator
-# token). ``weak`` violations are scope-coverage / audit-completeness
-# checks (outstanding probes still listed, relation-graph walk not
-# recorded) — useful early but, past the soft cap, more likely to drive
-# unbounded looping than to catch real errors. The soft-cap branch in
-# the pipeline drops ``weak`` violations and keeps ``critical`` ones live.
+# no [direct] fact, naming a mechanism with only [symptom] support).
+# ``weak`` violations are scope-coverage / audit-completeness checks
+# (outstanding probes still listed, relation-graph walk not recorded) —
+# useful early but, past the soft cap, more likely to drive unbounded
+# looping than to catch real errors. The soft-cap branch in the
+# pipeline drops ``weak`` violations and keeps ``critical`` ones live.
 _GATE_CRITICAL = "critical"
 _GATE_WEAK = "weak"
 
@@ -371,6 +365,8 @@ def _finalize_gate_violations(
     violations only.
     """
     if not decision.result:
+        return []
+    if decision.result.lstrip().startswith("[INSUFFICIENT_EVIDENCE]"):
         return []
     violations: list[tuple[str, str]] = []
     candidate = decision.leading_candidate
@@ -412,15 +408,16 @@ def _finalize_gate_violations(
         ))
     if candidate and not decision.related_entities_check.is_populated():
         violations.append((
-            _GATE_WEAK,
+            _GATE_CRITICAL,
             "related_entities_check.entities_examined is empty. Per rule 4 "
             "(WALK BEFORE BLAMING), the walk is mandatory before "
             "finalizing — name the related entities (per the active "
-            "skill's relation graph) you inspected and set "
-            "promotion_made / promoted_to accordingly. If the active "
-            "skill explicitly declares no relation graph applies to "
-            "this task, list the candidate itself as the only entity "
-            "examined to record that fact for the audit log.",
+            "skill's relation graph) you inspected, annotate each with "
+            "its relative deviation, and set promotion_made / promoted_to "
+            "accordingly. If the active skill explicitly declares no "
+            "relation graph applies to this task, list the candidate "
+            "itself as the only entity examined to record that fact for "
+            "the audit log.",
         ))
     if candidate and not decision.candidate_baseline.is_populated():
         missing = []
@@ -484,54 +481,7 @@ def _finalize_gate_violations(
                 "support is insufficient for naming a causal process.",
             ))
 
-    # Discriminator gate (mode coverage): if the reflector committed to
-    # a specific mechanism class, the artifact store must contain at
-    # least one [direct] / [deviation] fact carrying a discriminator
-    # token for that class. Scanning the store (not just
-    # mechanism_evidence) is intentional — the executor frequently
-    # produces a discriminator fact that the reflector forgets to cite
-    # in mechanism_evidence; we don't want the gate to reject a
-    # finalize whose underlying evidence actually exists. Conversely,
-    # a mechanism_class commitment with NO matching fact anywhere is a
-    # hard reject: it is the exact failure pattern the benchmark
-    # reflections kept surfacing (mechanism named, discriminator
-    # never queried).
-    if decision.proposed_mechanism and decision.mechanism_class != MechanismClass.OTHER:
-        high_grade_facts = "\n".join(
-            [artifacts.all_direct_facts(), artifacts.all_deviation_facts()]
-        )
-        # Combine artifact-store evidence with anything the reflector
-        # cited inline; either qualifies as "the fact exists in this
-        # run" for gate purposes.
-        combined = (
-            high_grade_facts + "\n" + "\n".join(decision.mechanism_evidence)
-        )
-        for msg in discriminator_violations(decision.mechanism_class, combined):
-            violations.append((_GATE_CRITICAL, msg))
-
     return violations
-
-
-def _discriminator_unmet(
-    decision: ReflectDecision, artifacts: ArtifactStore
-) -> bool:
-    """True iff the reflector's mechanism_class lacks any discriminator token
-    in the high-grade evidence + cited mechanism_evidence.
-
-    Same semantics as the discriminator branch of ``_finalize_gate_violations``,
-    extracted so the force-finalize branch can act on it (downgrade to OTHER)
-    without re-running the rest of the gate, which is intentionally suspended
-    at force-finalize.
-    """
-    if not decision.proposed_mechanism:
-        return False
-    if decision.mechanism_class == MechanismClass.OTHER:
-        return False
-    high_grade = "\n".join(
-        [artifacts.all_direct_facts(), artifacts.all_deviation_facts()]
-    )
-    combined = high_grade + "\n" + "\n".join(decision.mechanism_evidence)
-    return bool(discriminator_violations(decision.mechanism_class, combined))
 
 
 def _extract_assistant_text(result) -> str:
@@ -1717,33 +1667,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
             # `result` despite the explicit instruction, fall back to
             # surfacing the raw text so the user gets something.
             if force_finalize:
-                # Discriminator gate: the only critical gate we keep live
-                # at force-finalize. Rejecting outright would mean
-                # returning nothing, so instead we DOWNGRADE the
-                # commitment — rewrite mechanism_class to OTHER and
-                # prepend a caveat to the result so the user sees that
-                # the named mechanism was not backed by its
-                # discriminator. This catches the failure pattern where
-                # the reflector keeps proposing a class whose
-                # discriminator token was never observed and the
-                # round/wallclock cap finally lets it through.
-                downgraded_class: MechanismClass | None = None
-                if _discriminator_unmet(decision, artifacts):
-                    downgraded_class = decision.mechanism_class
-                    log_warning_event(
-                        logger,
-                        "[per] force-finalize: discriminator token never "
-                        f"observed for mechanism_class={downgraded_class.value}; "
-                        "downgrading to OTHER and surfacing caveat",
-                        "per.pipeline.force_finalize_downgrade",
-                        reflect_rounds=reflect_rounds,
-                        steps_executed=steps_executed,
-                        original_mechanism_class=downgraded_class.value,
-                        leading_candidate=decision.leading_candidate,
-                    )
-                    decision.mechanism_class = MechanismClass.OTHER
-
-                base_text = (
+                final_text = (
                     decision.result
                     or last_reflect_text
                     or _force_finalize_fallback_report(
@@ -1753,23 +1677,6 @@ def create_per_agent(opensearch_url: str) -> Agent:
                         steps_executed=steps_executed,
                     )
                 )
-                if downgraded_class is not None:
-                    caveat = (
-                        f"> **Caveat (force-finalize downgrade):** the "
-                        f"reflector named `{downgraded_class.value}` as the "
-                        "mechanism, but no [direct] / [deviation] fact in "
-                        "this run carries a discriminator token for that "
-                        "class (e.g. `cfs_throttled` for "
-                        "cpu-compute-saturation, `packets_dropped` / `RTO` "
-                        "for network-loss, `working_set` / `OOMKilled` for "
-                        "memory-pressure). The mechanism is therefore "
-                        "**unverified**; treat the named cause as the "
-                        "reflector's best guess from indirect evidence "
-                        "rather than a discriminator-backed conclusion."
-                    )
-                    final_text = caveat + "\n\n" + base_text
-                else:
-                    final_text = base_text
                 total_ms = int((time.perf_counter() - pipeline_started) * 1000)
                 log_info_event(
                     logger,
@@ -1795,14 +1702,13 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 # drop WEAK violations only (scope coverage, audit
                 # completeness). CRITICAL violations — no [direct] fact
                 # for the candidate, missing mechanism, missing
-                # alternatives, missing discriminator token — stay
-                # binding regardless of round count, because accepting
-                # those past the soft cap would silently allow exactly
-                # the symptom-only / un-falsifiable mechanism finalization
-                # the gates exist to catch. Unbounded looping is bounded
-                # separately by `pipeline_wall_clock_budget_seconds` and
-                # `force_finalize_after_rounds` (which suspends gates
-                # except `mechanism_alternatives`).
+                # alternatives — stay binding regardless of round count,
+                # because accepting those past the soft cap would
+                # silently allow exactly the symptom-only /
+                # un-falsifiable mechanism finalization the gates exist
+                # to catch. Unbounded looping is bounded separately by
+                # `pipeline_wall_clock_budget_seconds` and
+                # `force_finalize_after_rounds` (which suspends gates).
                 if weak and reflect_rounds >= _LIMITS.finalize_gate_soft_cap_rounds:
                     log_warning_event(
                         logger,

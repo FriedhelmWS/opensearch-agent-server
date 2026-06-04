@@ -34,7 +34,6 @@ from strands.models.bedrock import BedrockModel
 from strands.models.model import CacheConfig
 from strands.tools.mcp import MCPClient
 
-from agents.per.mechanism_discriminators import MechanismClass
 from agents.skills_plugin import LoggingAgentSkills, load_skills_from_dir
 from utils.logging_helpers import get_logger, log_info_event
 
@@ -96,7 +95,7 @@ def _skills_plugin() -> list:
 # (and downstream reflector reading findings) sees that more data exists
 # and can issue a narrower follow-up query rather than assuming the
 # result was complete.
-_MCP_TOOL_RESULT_MAX_CHARS = 50_000
+_MCP_TOOL_RESULT_MAX_CHARS = 40_000
 
 
 def _truncate_tool_result_hook(event: AfterToolCallEvent) -> None:
@@ -278,9 +277,13 @@ class BaselineComparison(BaseModel):
         description=(
             "Concise expression of the candidate-to-reference relationship: "
             "ratio, percentage delta, fold change, or 'pinned at limit in "
-            "both windows'. The framework treats this as the auditable "
-            "summary of why the candidate is named — not just that some "
-            "values were collected."
+            "both windows'. MUST also note when the candidate's deviation "
+            "began relative to symptom onset (cause must precede effect — "
+            "a deviation that starts AFTER the symptom indicates a victim, "
+            "not a cause; if exact timing is unavailable, state that "
+            "explicitly rather than skipping it). The framework treats "
+            "this as the auditable summary of why the candidate is named "
+            "— not just that some values were collected."
         ),
     )
 
@@ -316,8 +319,14 @@ class RelatedEntityCheck(BaseModel):
         description=(
             "Related entities the reflector inspected for the leading "
             "candidate (per the active skill's relation graph: dependencies, "
-            "peers, parents, callees, neighbors, etc.). Empty only when no "
-            "candidate is named yet."
+            "peers, parents, callees, neighbors, etc.). Each entry MUST "
+            "carry the entity's relative-deviation annotation in the form "
+            "`<entity> (deviation: <ratio/delta or 'none observed'>)` so "
+            "the audit can verify the leading candidate deviates more "
+            "than its neighbors. Coverage MUST include at least one "
+            "upstream caller AND one downstream dependency when the "
+            "relation graph contains them. Empty only when no candidate "
+            "is named yet."
         ),
     )
     promotion_made: bool = Field(
@@ -443,30 +452,19 @@ class ReflectOutput(BaseModel):
             "stalling request handlers', 'connection pool exhaustion forcing "
             "RTT-multiple retransmits', 'credential reuse from leaked "
             "secret', 'cache invalidation race', 'schema drift dropping "
-            "records'). The active domain skill defines the candidate "
-            "mechanism set; if no skill applies, derive mechanisms from "
-            "first principles by asking 'what causal process could produce "
-            "this observation?' Empty only when leading_candidate is also "
-            "empty (no candidate yet)."
-        ),
-    )
-    mechanism_class: MechanismClass = Field(
-        default=MechanismClass.OTHER,
-        description=(
-            "Discrete classification of `proposed_mechanism` into one of "
-            "the framework-recognised mechanism families. Picking a "
-            "specific class (not 'other') is a COMMITMENT — the finalize "
-            "gate will require at least one [direct] / [deviation] "
-            "KNOWN_FACT carrying a discriminator token for that class. "
-            "The discriminator vocabulary is the field-name / log-keyword "
-            "set that the corresponding ppl-probes probe template "
-            "produces. Pick 'other' when the active domain skill defines "
-            "a mechanism this taxonomy does not yet cover; do NOT pick "
-            "'other' merely to bypass the discriminator gate. Available "
-            "values: network-loss, socket-exhaustion, disk-io-saturation, "
-            "cpu-compute-saturation, memory-pressure, gc-pause, "
-            "lock-contention, dependency-degradation, injected-delay, "
-            "other."
+            "records'). Must go at least one layer deeper than the "
+            "immediate trigger — name the upstream condition (capacity "
+            "setting, config drift, load inflection, recent change) that "
+            "let the immediate process manifest now rather than ever "
+            "before. Composite causes (`A + B → effect`, where neither A "
+            "nor B alone is sufficient) are allowed and should be "
+            "expressed in this form when evidence supports them; the "
+            "magnitudes named must be plausibly large enough to produce "
+            "the observed output deviation. The active domain skill "
+            "defines the candidate mechanism set; if no skill applies, "
+            "derive mechanisms from first principles by asking 'what "
+            "causal process could produce this observation?' Empty only "
+            "when leading_candidate is also empty (no candidate yet)."
         ),
     )
     mechanism_alternatives: list[str] = Field(
@@ -474,14 +472,20 @@ class ReflectOutput(BaseModel):
         description=(
             "Other mechanisms that could plausibly produce the same observed "
             "symptoms, each annotated with why it is ranked below "
-            "proposed_mechanism (or why it remains open). Format each entry "
-            "as '<alternative mechanism>: <rationale for ranking / "
-            "falsification status>'. MUST contain at least 2 entries when "
+            "proposed_mechanism (or why it remains open) AND with the "
+            "evidence that would distinguish it. Format each entry as "
+            "'<alternative mechanism>: <rationale for ranking / "
+            "falsification status>; distinguished by: <observation that "
+            "would settle it>'. MUST contain at least 2 entries when "
             "proposed_mechanism is set — explicit enumeration of competing "
             "explanations is required to prevent hypothesis-space collapse "
-            "after finding one self-consistent story. Each alternative is "
-            "either ruled out (cite the KNOWN_FACT that falsifies it) or "
-            "kept as a still-plausible competing hypothesis (state why "
+            "after finding one self-consistent story. Alternatives MUST "
+            "span at least two distinct mechanism families (resource / "
+            "network / code-path / config / external dependency / load-mix "
+            "shift); listing two micro-variants of the same family does "
+            "not satisfy this rule. Each alternative is either ruled out "
+            "(cite the KNOWN_FACT that falsifies it) or kept as a "
+            "still-plausible competing hypothesis (state why "
             "proposed_mechanism is preferred on current evidence)."
         ),
     )
@@ -491,8 +495,18 @@ class ReflectOutput(BaseModel):
             "List of KNOWN_FACTS bullets (quoted or paraphrased) that "
             "support proposed_mechanism. MUST include at least one fact "
             "tagged [direct] or [deviation] — symptom-only support is "
-            "insufficient for a mechanism claim. These are the facts a "
-            "reviewer would need to read to verify the mechanism choice."
+            "insufficient for a mechanism claim. SHOULD triangulate "
+            "across at least two distinct evidence sources (log / metric "
+            "/ trace / config / schema) when the data permits — "
+            "single-source mechanism support is fragile because one "
+            "instrumentation defect can fabricate it. MUST also include "
+            "one fact addressing recent-change correlation (deploy, "
+            "config change, traffic shift, dependency upgrade in the "
+            "relevant window); if no relevant change is observable, "
+            "record `[schema] no recent-change signal available in "
+            "<source>` rather than silently skipping the question. These "
+            "are the facts a reviewer would need to read to verify the "
+            "mechanism choice."
         ),
     )
     dimensions_invalidated: list[str] = Field(
@@ -519,7 +533,16 @@ class ReflectOutput(BaseModel):
     result: str = Field(
         default="",
         description=(
-            "Final comprehensive report. Empty when more steps are needed."
+            "Final comprehensive report. Empty when more steps are needed. "
+            "MUST end with a single line of the form `Testable prediction: "
+            "<remediation> would <expected effect on named [direct] / "
+            "[deviation] facts>` so the proposed mechanism is falsifiable "
+            "by post-fix observation. If the run cannot ground a candidate "
+            "at all, the report's first line MUST be exactly the literal "
+            "token `[INSUFFICIENT_EVIDENCE]` — this honest exit bypasses "
+            "all finalize gates so the agent can list what was ruled out "
+            "and what additional data is required without confabulating a "
+            "candidate."
         ),
     )
 
@@ -638,7 +661,7 @@ Parallel tool-use rules:
 - A set of invocations is INDEPENDENT (and SHOULD run in parallel) when none of them reads a value — a field name, an id, a discovered count, a schema fact — produced by another in the same set. Examples: describing or sampling several different indices; running the same aggregation against multiple time windows; checking presence of several distinct fields; running an anomaly-window query and a baseline-window query for the same metric.
 - A set of invocations is DEPENDENT (and MUST run sequentially across turns) when a later invocation needs a value the earlier one produces. Examples: "sample one document to learn the field name, then aggregate using that field"; "list indices, then describe whichever one matches a pattern"; "find the slowest service, then drill into its spans".
 - When in doubt about independence, default to sequential — a single redundant turn is much cheaper than dispatching dependent calls with guessed parameters and then re-running them with the right ones.
-- Cap on per-turn parallel tool calls: emit AT MOST 2 `tool_use` blocks in a single response. If you have more than 2 independent invocations to run, issue 2 in this turn and queue the rest for the next turn. Reason: each tool_result accumulates in the next request's payload alongside the pre-injected KNOWN_FACTS / QUERIES_EXECUTED context, and 3+ large tool_results in one turn has been observed to overflow the model's context window. Two-at-a-time still captures most of the wall-clock benefit of parallel dispatch without the overflow risk.
+- Cap on per-turn parallel tool calls: emit AT MOST 3 `tool_use` blocks in a single response. If you have more than 3 independent invocations to run, issue 3 in this turn and queue the rest for the next turn. Reason: each tool_result accumulates in the next request's payload alongside the pre-injected KNOWN_FACTS / QUERIES_EXECUTED context, and 4+ large tool_results in one turn risks overflowing the model's context window. Three-at-a-time captures most of the wall-clock benefit of parallel dispatch without the overflow risk.
 
 Output structure:
 Your response MUST end with TWO required sections, in this order: a `QUERIES_EXECUTED:` section, then a `KNOWN_FACTS:` section.
@@ -652,7 +675,7 @@ If you only inspected a mapping or schema (no actual data query), say so explici
 
 EACH fact bullet MUST start with one of four classification tags so downstream phases can reason about evidence quality:
 
-- `[direct]` — evidence whose presence unambiguously implies a specific cause or hypothesis (combined with relevant `[deviation]` facts when needed). Direct facts are the only kind eligible to support a final attribution.
+- `[direct]` — evidence whose presence DISTINGUISHES a specific candidate or mechanism FROM its alternatives — not merely evidence that mentions the candidate. The test is: would this fact look the same under a competing hypothesis? If yes, it is `[symptom]`, not `[direct]`. Direct facts cite a discriminating field name, log signature, stack trace line, configuration delta, or invariant violation (e.g., `cfs_throttled_periods` for compute saturation, `tcp_retransmit` for network loss, `NullPointerException at FooHandler.handle:42` for a code-path bug, `pool_exhausted=true` for connection-pool starvation). Direct facts are the only kind eligible to support a final attribution. Co-occurrence is NOT direct: "X is high when Y is high" is `[symptom]`.
 - `[symptom]` — evidence consistent with the leading hypothesis but ALSO consistent with several other hypotheses. Symptom facts are context only — they CANNOT support a final attribution by themselves.
 - `[deviation]` — a numeric measurement that explicitly cites BOTH a current value AND a comparable reference value (a prior time window, a peer entity, a documented spec, etc.), plus the ratio or percentage change. The deviation tag is what makes ranking by RELATIVE change possible (and protects the investigation from absolute-magnitude bias). A measurement without a comparable reference is NOT a deviation fact.
 - `[schema]` — discoveries about the data itself: field presence/absence, types, units, naming conventions, population rates. These are operationally critical (they prevent rediscovery) but neither support nor refute any hypothesis.
@@ -699,7 +722,7 @@ Return your decision by calling the structured-output tool exposed to you. The t
 
 Brevity discipline (applies to every turn EXCEPT when populating the final `result` field):
 - `candidate_reason` / `outlier_reason`: ≤ 1 sentence each. The criterion must be present (relative-deviation citation, causal-walk outcome) but expressed tersely — verbosity here doesn't strengthen the audit, it just costs tokens.
-- `mechanism_alternatives` entries: ≤ 1 sentence each. Format `<alternative>: <falsification status / ranking rationale>` — you do not need to defend each rejection at length; one line stating WHY it ranks below the top pick is sufficient.
+- `mechanism_alternatives` entries: ≤ 1 sentence each. Format `<alternative>: <falsification status / ranking rationale>; distinguished by: <observation that would settle it>` — you do not need to defend each rejection at length; one line stating WHY it ranks below the top pick PLUS what evidence would distinguish it is sufficient.
 - `mechanism_evidence` entries: cite the supporting KNOWN_FACT bullet by tag and key value (e.g., "[direct] ts-X memory 78%/limit"). Do NOT paste the full fact body — the orchestrator already has it.
 - `outstanding_probes` entries: ≤ 1 short phrase each (a probe target, symptom name, or dimension identifier), not a paragraph.
 - `dimensions_invalidated` entries: short identifier with a brief KNOWN_FACT cite (`<item>: <KNOWN_FACT id or paraphrase>`).
@@ -729,12 +752,12 @@ Critical rules:
 1. NEVER repeat a step that has already been completed. Completed steps are listed in the "Completed steps (summary)" section of your input. Their KNOWN_FACTS have already been captured and are available to you.
 2. NEVER re-issue a hypothesis that has already been ruled out by KNOWN_FACTS (e.g., do not propose using a field that facts say is null/absent; do not propose a tool path that facts say doesn't exist). Do NOT echo or restate the original plan in your output — it is informational context, not output. (See response header: exactly one of `next_steps` / `result` non-empty per turn.)
 3. SCOPE COVERAGE BEFORE FINALIZE — every plan step, every enumerated item inside a plan step, every `[symptom]` fact, every skill-defined investigation dimension, and every named direct indicator must be either (a) actively probed and resolved by KNOWN_FACTS, or (b) explicitly invalidated by a citing KNOWN_FACT (record in `dimensions_invalidated`). Anything still pending lives in `outstanding_probes`; finalize only when that list is empty (for items touching the leading candidate). Silently dropping plan steps, enumerated subsets, parked symptoms, or expected dimensions is the most common path to mis-classified mechanism.
-4. WALK BEFORE BLAMING — before attributing the leading_candidate's deviation to a different entity, you MUST first verify the candidate's own signals have been probed (visible in QUERIES_EXECUTED), AND walk the candidate's relation graph as defined by the active domain skill (dependencies, callees, parents/children, peers, upstream resources — whatever the skill specifies; if no skill applies, derive a relation graph from the data itself) checking whether a related entity shows a stronger relative deviation that should take its place. Record the walk's outcome in the `related_entities_check` field — list every related entity examined, set `promotion_made` and `promoted_to` if you reassign the leading candidate. An entity that is merely NAMED in symptom text is NOT automatically the cause — the cause is the entity whose OWN signals exhibit the anomalous pattern.
-5. RANK BY RELATIVE DEVIATION, BACK BY DIRECT EVIDENCE — rank candidates by how far each entity's measurement has moved relative to a comparable reference (its own baseline, a peer, or a documented spec — the active skill defines which), not by absolute magnitude across entities. A small absolute change can be a large relative deviation; a large absolute number that matches the entity's own normal is NOT anomalous. Record the relative-deviation evidence in the `candidate_baseline` field — `candidate_value`, `reference_value`, and `deviation_summary` MUST all be populated before finalizing. `result` may only be populated when every entity named in the conclusion is supported by at least one `[direct]` KNOWN_FACT; symptom-only attribution is forbidden. Apparent improvement (a counter falling, a signal disappearing) is itself a signal — stall, silent failure, throttling, or measurement loss may explain it; do not treat improvement as exoneration without an active probe with a comparable reference.
-6. MECHANISM — `proposed_mechanism` must name a CAUSAL PROCESS, not an observation; an exception class, metric label, or anomaly name describes WHAT was observed, not WHY. Restate as "<process> in <candidate> produces <observed symptoms> via <pathway>" and verify it explains every parked symptom and direct fact, not just the loudest. `mechanism_alternatives` MUST contain at least 2 entries when `proposed_mechanism` is set — for each, either cite the KNOWN_FACT that falsifies it or state why it remains plausible-but-ranked-below. Symmetric / fingerprint-equivalent mechanisms (different causal processes that produce identical observations) MUST appear here when the active domain skill names such pairs (the skill is the authoritative source for which dualities apply to your domain — supply/demand for performance work, intent/incident for security work, etc.); when no skill applies, derive at least one such pair from first principles by asking "what other process would have produced the same observation?". `mechanism_evidence` must include at least one `[direct]` or `[deviation]` fact.
-   MECHANISM CLASS COMMITMENT — `mechanism_class` selects one of the framework-recognised mechanism families (network-loss, socket-exhaustion, disk-io-saturation, cpu-compute-saturation, memory-pressure, gc-pause, lock-contention, dependency-degradation, injected-delay, other). Picking a specific class commits you to producing at least one `[direct]` / `[deviation]` KNOWN_FACT whose body cites a DISCRIMINATOR token for that class — the field name or log fragment that distinguishes it from its near-twins. The discriminator vocabulary is the field-name / log-keyword set produced by the corresponding probe template in the `ppl-probes` skill (activate it once you commit to a class); the orchestrator's finalize gate enforces this match programmatically. Examples: declaring `network-loss` requires a fact mentioning `packets_dropped`, `tcp_retransmit`, `RTO`, `connection reset`, or a bimodal-at-RTO-multiples latency shape; declaring `disk-io-saturation` requires a fact mentioning `fs_io_time`, `iowait`, `fsync`, `ENOSPC`, or `EIO`; declaring `cpu-compute-saturation` requires `cfs_throttled`, throttled-seconds, run-queue depth, or a per-request CPU-time delta — a raw "CPU is high" fact does NOT discriminate from iowait spinning, busy-wait, or GC thrash and will be rejected. If the active domain skill defines a mechanism this taxonomy does not cover, set `mechanism_class` to `other`; do NOT pick `other` to bypass the discriminator gate when a registered class fits.
+4. WALK BEFORE BLAMING — before attributing the leading_candidate's deviation to a different entity, you MUST first verify the candidate's own signals have been probed (visible in QUERIES_EXECUTED), AND walk the candidate's relation graph as defined by the active domain skill (dependencies, callees, parents/children, peers, upstream resources — whatever the skill specifies; if no skill applies, derive a relation graph from the data itself) checking whether a related entity shows a stronger relative deviation that should take its place. Record the walk's outcome in the `related_entities_check` field — list every related entity examined, AND for each entity append its relative-deviation summary in the form `<entity> (deviation: <ratio/delta or 'none observed'>)` so the audit can verify the leading candidate actually deviates more than its neighbors rather than just being the loudest in absolute terms. The walk MUST cover at least one upstream caller AND at least one downstream dependency when the relation graph contains either; coverage limited to peers / siblings is insufficient because root cause typically lives one hop up- or down-stream from the symptom site. Set `promotion_made` and `promoted_to` if you reassign the leading candidate. An entity that is merely NAMED in symptom text is NOT automatically the cause — the cause is the entity whose OWN signals exhibit the anomalous pattern.
+5. RANK BY RELATIVE DEVIATION, BACK BY DIRECT EVIDENCE — rank candidates by how far each entity's measurement has moved relative to a comparable reference (its own baseline, a peer, or a documented spec — the active skill defines which), not by absolute magnitude across entities. A small absolute change can be a large relative deviation; a large absolute number that matches the entity's own normal is NOT anomalous. Record the relative-deviation evidence in the `candidate_baseline` field — `candidate_value`, `reference_value`, and `deviation_summary` MUST all be populated before finalizing, AND `deviation_summary` MUST note when the candidate's deviation began relative to the user-reported symptom onset (cause must precede effect — a deviation that began AFTER the symptom indicates a victim, not a cause; if exact timing is unavailable, state so explicitly rather than skipping it). `result` may only be populated when every entity named in the conclusion is supported by at least one `[direct]` KNOWN_FACT; symptom-only attribution is forbidden. Apparent improvement (a counter falling, a signal disappearing) is itself a signal — stall, silent failure, throttling, or measurement loss may explain it; do not treat improvement as exoneration without an active probe with a comparable reference.
+6. MECHANISM — `proposed_mechanism` must name a CAUSAL PROCESS, not an observation; an exception class, metric label, or anomaly name describes WHAT was observed, not WHY. Restate as "<process> in <candidate> produces <observed symptoms> via <pathway>", and go at least one layer deeper than the immediate trigger — name the upstream condition (capacity setting, config drift, load inflection, recent change) that allowed the immediate process to manifest now rather than ever before. Verify the mechanism explains every parked symptom and direct fact, not just the loudest, AND that the magnitudes line up: the input deviation must be plausibly large enough to produce the observed output deviation (a +5% input cannot explain a +25× output without an additional amplifier — name it). Composite causes (`A + B → effect`, where neither A nor B alone is sufficient) are allowed and should be expressed in this form when the evidence supports them. `mechanism_alternatives` MUST contain at least 2 entries when `proposed_mechanism` is set, and each alternative MUST end with `distinguished by: <observation that would settle it>` so the audit log records what evidence WOULD falsify the choice — for each, either cite the KNOWN_FACT that falsifies it or state why it remains plausible-but-ranked-below. Alternatives MUST span at least two distinct mechanism families (resource / network / code-path / config / external dependency / load-mix shift) — listing two micro-variants of the same family does not satisfy this rule. Symmetric / fingerprint-equivalent mechanisms (different causal processes that produce identical observations) MUST appear here when the active domain skill names such pairs (the skill is the authoritative source for which dualities apply to your domain — supply/demand for performance work, intent/incident for security work, etc.); when no skill applies, derive at least one such pair from first principles by asking "what other process would have produced the same observation?". `mechanism_evidence` must include at least one `[direct]` or `[deviation]` fact AND should triangulate across at least two distinct evidence sources (log / metric / trace / config / schema) when the data permits — single-source mechanism support is fragile because a single instrumentation defect can fabricate it. `mechanism_evidence` MUST also include one fact addressing recent-change correlation (deploy, config change, traffic shift, dependency upgrade in the relevant window); if no relevant change is observable from the data, record `[schema] no recent-change signal available in <source>` rather than silently skipping the question.
 7. PREFER COMPUTABLE INVARIANTS OVER NARRATIVE — when the active domain skill defines computable invariants (quantities that should hold equal, sum to a known total, conserve across boundaries, etc.), check at least one before finalizing and record the result in `mechanism_evidence`. Invariants are stronger evidence than narrative because they are mechanically falsifiable: a violated invariant is a direct mechanism signature. Where the skill is silent, derive an invariant from first principles (conservation, monotonicity, rate-limiting bounds) before defaulting to narrative explanation.
 8. Finalize with `result` only when rules 3–7 are ALL satisfied AND the cumulative evidence answers the objective. Premature finalization on a partial picture is the single most common failure mode of this pipeline — actively guard against it.
+9. INSUFFICIENT-EVIDENCE EXIT — if the available data genuinely cannot ground a candidate (no entity carries a `[direct]` fact, no comparable reference exists for any candidate, the relevant data source is empty/unavailable, etc.), you MAY finalize with a `result` that begins exactly with the literal token `[INSUFFICIENT_EVIDENCE]` on its first line. This path bypasses all finalize gates because the report's purpose is to honestly state what was ruled out (X, Y, Z) and what additional data is required to proceed, NOT to attribute. Do not use this exit when evidence merely points weakly — only when no defensible candidate exists at all. Confabulating a candidate to satisfy gates is worse than this honest exit.
 
 Important rules for the response:
 1. Call the structured-output tool with all fields populated per the field semantics above.
@@ -751,6 +774,8 @@ When you deliver your final result, include a comprehensive report. This report 
 4. Clearly explain how the steps led to your final conclusion. Only mention the completed steps.
 5. Return the full analysis and conclusion in the `result` field, even if some of it appeared in earlier turns. Write the report as plain markdown — Strands' structured-output layer handles JSON encoding for you, do NOT manually escape special characters.
 6. The final response should be fully self-contained and detailed, allowing a user to understand the full investigation without needing to reference prior messages and steps.
+7. End with one line of the form `Testable prediction: <remediation> would <expected effect on the named [direct] / [deviation] facts>`. This makes the proposed mechanism falsifiable by post-fix observation — without a prediction the conclusion cannot be checked.
+8. If the run genuinely cannot ground a candidate (no [direct] fact for any entity, no comparable reference, missing data source), make the FIRST line of the report exactly the literal token `[INSUFFICIENT_EVIDENCE]`. The remainder should list what was ruled out and what additional data is needed; this honest exit is preferred over confabulating a candidate to satisfy the gates.
 """
 
 # Describes the actual input shape the orchestrator sends each turn
@@ -931,7 +956,7 @@ def build_plan_agent() -> Agent:
 
 
 # Hard cap on tool calls a single executor agent can issue across its
-# multi-turn invocation. The prompt-level "AT MOST 2 tool_use blocks per
+# multi-turn invocation. The prompt-level "AT MOST 3 tool_use blocks per
 # response" rule is advisory and was repeatedly ignored by the model
 # (observed in benchmark step 12: a single executor turn that issued 28
 # tool calls over five minutes). This cap is enforced via a
