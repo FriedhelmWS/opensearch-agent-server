@@ -71,6 +71,7 @@ from server.constants import DEFAULT_MCP_SERVER_URL
 from utils.logging_helpers import get_logger, log_info_event, log_warning_event
 from utils.monitored_tool import monitored_tool
 from utils.obo_context import OboAuth
+from utils.token_usage_context import set_inner_usage
 
 logger = get_logger(__name__)
 
@@ -1381,6 +1382,14 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 "by_phase": by_phase_with_ratio,
                 "per_round": usage_totals["per_round"],
             }
+            # Publish to the shared ContextVar so the agent_orchestrator
+            # can fold this into a CustomEvent emitted right before
+            # RUN_FINISHED. Inner sub-agent token usage is otherwise
+            # invisible to the outer Bedrock call's
+            # ``event_loop_metrics.accumulated_usage`` — without this
+            # handoff the orchestrator's CustomEvent would under-count
+            # the PER pipeline by ~40×.
+            set_inner_usage(payload)
             trailer = (
                 "\n\n<!-- per_token_usage_begin v=2 -->\n"
                 + json.dumps(payload, separators=(",", ":"))
