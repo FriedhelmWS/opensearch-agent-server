@@ -14,6 +14,7 @@ import httpx
 from mcp.client.streamable_http import streamable_http_client
 from strands import Agent, AgentSkills, Skill
 from strands.models.bedrock import BedrockModel
+from strands.models.model import CacheConfig
 from strands.tools.mcp import MCPClient
 
 from server.constants import DEFAULT_MCP_SERVER_URL
@@ -179,9 +180,17 @@ def create_default_agent(opensearch_url: str) -> Agent:
             skill_names=[s.name for s in skills],
         )
 
-    # Prompt caching disabled — cache_tools / cache_config omitted so
-    # Bedrock does not place cache breakpoints. Every turn's full prefix
-    # is billed at the standard input rate.
+    # Bedrock model with prompt caching enabled. ``cache_tools="default"``
+    # injects a cache breakpoint right after the tool schema, which
+    # implicitly covers the system prompt (everything before the
+    # breakpoint becomes the cached prefix). ``cache_config(strategy=
+    # "auto")`` lets Strands also place breakpoints inside the
+    # conversation so large tool results — e.g. an OpenSearch
+    # ``SearchIndexTool`` response of ~250K tokens — are paid for once
+    # and read from cache on every subsequent turn at ~10% of the input
+    # price. Without this, a 22-turn investigation re-bills every prior
+    # tool result on every turn; we observed cases consuming >1M input
+    # tokens for that reason.
     #
     # Model ID resolution: read ``BEDROCK_INFERENCE_PROFILE_ARN`` —
     # the same env var the PER planner / reflector reads — so both
@@ -195,6 +204,8 @@ def create_default_agent(opensearch_url: str) -> Agent:
         boto_session=boto3.Session(),
         streaming=True,
         max_tokens=32768,
+        cache_tools="default",
+        cache_config=CacheConfig(strategy="auto"),
     )
 
     # Create agent with MCP tools and skills plugin

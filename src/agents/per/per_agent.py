@@ -36,6 +36,7 @@ import httpx
 from mcp.client.streamable_http import streamable_http_client
 from strands import Agent
 from strands.models.bedrock import BedrockModel
+from strands.models.model import CacheConfig
 from strands.tools.mcp import MCPClient
 
 from agents.per.artifact_store import ArtifactStore
@@ -786,13 +787,16 @@ def create_per_agent(opensearch_url: str) -> Agent:
             f"to continue.\n\nLast reflection:\n{last_reflect_text or '(no reflection)'}"
         )
 
-    # Prompt caching disabled — cache_tools / cache_config omitted so
-    # Bedrock does not place cache breakpoints.
     orchestrator_model = BedrockModel(
         model_id=os.environ["BEDROCK_INFERENCE_PROFILE_ARN"],
         boto_session=boto3.Session(),
         streaming=True,
         max_tokens=32768,
+        # ``cache_tools`` injects a cache point after the tool schema; the
+        # cached prefix covers the system prompt automatically. We avoid
+        # the deprecated ``cache_prompt`` here for the same reason.
+        cache_tools="default",
+        cache_config=CacheConfig(strategy="auto"),
     )
 
     orchestrator = Agent(
