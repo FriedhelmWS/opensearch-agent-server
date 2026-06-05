@@ -21,7 +21,6 @@ import os
 import boto3
 from strands import Agent
 from strands.models.bedrock import BedrockModel
-from strands.models.model import CacheConfig
 from strands.tools.mcp import MCPClient
 
 from utils.logging_helpers import get_logger, log_info_event
@@ -315,33 +314,22 @@ _MAX_OUTPUT_TOKENS = 32768
 
 
 def _model(*, cache_tools: bool = False) -> BedrockModel:
-    # Prompt-caching strategy:
-    #   - For the executor: ``cache_tools="default"`` injects a cache point
-    #     at the end of the tool schema block. Bedrock caches the prefix up
-    #     to that point, which transparently covers the system prompt.
-    #   - For plan / reflect (no tools): ``cache_config(strategy="auto")``
-    #     injects a cache point at the end of the last user message. The
-    #     cached prefix again includes the system prompt.
-    # Both paths cover the ~2.5 KB sub-agent system prompt + (executor only)
-    # the MCP tool catalog, so re-iterations of the PER loop hit the cache.
-    #
-    # ``cache_prompt`` is intentionally NOT set — it's deprecated upstream
-    # in favor of explicit ``SystemContentBlock`` cache points, and the two
-    # mechanisms above already cover system caching.
+    # Prompt caching disabled — neither ``cache_tools`` nor ``cache_config``
+    # is forwarded to Bedrock, so no cache breakpoints are placed and every
+    # turn's prefix is billed at the standard input rate. The
+    # ``cache_tools`` parameter is retained for call-site compatibility
+    # but ignored.
     #
     # ``max_tokens`` is raised well above the Bedrock default because
     # executor responses can include raw tool outputs (full document
     # samples, large aggregation results) that the planner needs verbatim.
-    kwargs: dict = {
-        "model_id": os.getenv("BEDROCK_INFERENCE_PROFILE_ARN"),
-        "boto_session": bedrock_session,
-        "streaming": True,
-        "max_tokens": _MAX_OUTPUT_TOKENS,
-        "cache_config": CacheConfig(strategy="auto"),
-    }
-    if cache_tools:
-        kwargs["cache_tools"] = "default"
-    return BedrockModel(**kwargs)
+    del cache_tools
+    return BedrockModel(
+        model_id=os.getenv("BEDROCK_INFERENCE_PROFILE_ARN"),
+        boto_session=bedrock_session,
+        streaming=True,
+        max_tokens=_MAX_OUTPUT_TOKENS,
+    )
 
 
 def build_plan_agent() -> Agent:
