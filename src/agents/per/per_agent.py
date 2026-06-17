@@ -350,8 +350,59 @@ _GATE_CRITICAL = "critical"
 _GATE_WEAK = "weak"
 
 
-def _finalize_gate_violations(
+def _round_one_fast_path_eligible(
     decision: ReflectDecision, artifacts: ArtifactStore
+) -> bool:
+    """Whether round-1 evidence already converges on a single direct cause.
+
+    Some investigations resolve in a single execute batch — a saturation
+    gauge near its limit, a log message that unambiguously names a
+    failure class, a single component whose direct evidence dominates.
+    The standard finalize gates (related-entity walk, candidate baseline
+    with persistence summary, outstanding-probe coverage) are designed
+    for cases where the answer requires triangulation; on cases where
+    a single ``[direct]`` fact is itself the answer, they manufacture
+    busywork that doesn't change the conclusion and often drives the
+    pipeline into rounds of follow-up that degrade the report.
+
+    Eligibility requires ALL of:
+      - ``leading_candidate`` is named and has ``[direct]`` evidence;
+      - ``outlier_candidate`` is unnamed OR has no ``[direct]`` evidence
+        (no competing direct attribution survived round 1);
+      - ``proposed_mechanism`` is named (mechanism gate stays binding —
+        we suspend coverage gates, not the requirement that a causal
+        process accompany the named entity);
+      - ``mechanism_evidence`` cites at least one ``[direct]`` or
+        ``[deviation]`` fact (a mechanism with only ``[symptom]`` support
+        is the exact "exception class = root cause" anti-pattern fast-path
+        is most likely to misclassify).
+
+    The mechanism-alternatives gate (≥ 2 entries) is left untouched —
+    enumerating an alternative is the cheapest anti-confirmation-bias
+    check we have, and the saturation case is exactly where missing it
+    matters (CPU at 99% from local code vs. cascading upstream load).
+    """
+    if not decision.leading_candidate:
+        return False
+    if not artifacts.has_direct_fact_for(decision.leading_candidate):
+        return False
+    if decision.outlier_candidate and artifacts.has_direct_fact_for(
+        decision.outlier_candidate
+    ):
+        return False
+    if not decision.proposed_mechanism:
+        return False
+    evidence_blob = "\n".join(decision.mechanism_evidence).lower()
+    if "[direct]" not in evidence_blob and "[deviation]" not in evidence_blob:
+        return False
+    return True
+
+
+def _finalize_gate_violations(
+    decision: ReflectDecision,
+    artifacts: ArtifactStore,
+    *,
+    fast_path: bool = False,
 ) -> list[tuple[str, str]]:
     """Deterministic checks that must pass before ``result`` is accepted.
 
@@ -364,6 +415,14 @@ def _finalize_gate_violations(
     evidence-soundness checks and ``_GATE_WEAK`` for scope-coverage /
     audit-completeness checks; the pipeline's soft-cap branch drops weak
     violations only.
+
+    ``fast_path`` (set when ``_round_one_fast_path_eligible`` is True at
+    round 1) suspends the structural-coverage gates — related-entity
+    walk, candidate baseline, outstanding probes — that would otherwise
+    block trivially-resolvable single-direct-cause cases. The
+    direct-fact, mechanism, mechanism-alternatives, and mechanism-
+    evidence gates remain binding so a fast-path finalize still requires
+    a real causal claim with at least one alternative enumerated.
     """
     if not decision.result:
         return []
@@ -407,7 +466,11 @@ def _finalize_gate_violations(
             "invalidated (move to dimensions_invalidated with a citing "
             "KNOWN_FACT) before finalizing.",
         ))
-    if candidate and not decision.related_entities_check.is_populated():
+    if (
+        candidate
+        and not fast_path
+        and not decision.related_entities_check.is_populated()
+    ):
         violations.append((
             _GATE_CRITICAL,
             "related_entities_check.entities_examined is empty. Per rule 4 "
@@ -420,7 +483,7 @@ def _finalize_gate_violations(
             "itself as the only entity examined to record that fact for "
             "the audit log.",
         ))
-    if candidate and not decision.candidate_baseline.is_populated():
+    if candidate and not fast_path and not decision.candidate_baseline.is_populated():
         missing = []
         if not decision.candidate_baseline.candidate_value.strip():
             missing.append("candidate_value")
@@ -575,7 +638,8 @@ def _decide_force_finalize(
 
 
 def _synthesize_followup_steps(
-    decision: ReflectDecision, all_violations: list[str]
+    decision: ReflectDecision,
+    all_violations: list[str],
 ) -> list[str]:
     """Build the next-iteration pending_steps after a finalize-gate reject.
 
@@ -1705,19 +1769,47 @@ def create_per_agent(opensearch_url: str) -> Agent:
                 return _attach_usage_trailer(final_text)
 
             if decision.result:
-                raw_violations = _finalize_gate_violations(decision, artifacts)
+                # Round-1 fast path: when a single component owns
+                # ``[direct]`` evidence and no other candidate has
+                # ``[direct]`` support, the structural-coverage gates
+                # (related-entity walk, candidate baseline) only
+                # manufacture busywork. Suspend them for this round
+                # while keeping the direct-fact, mechanism, and
+                # mechanism-alternatives gates live. Only applied at
+                # round 1 — past round 1 the investigation has had
+                # cycles to triangulate and the gates are catching real
+                # gaps rather than blocking trivial answers.
+                fast_path = (
+                    reflect_rounds == 1
+                    and _round_one_fast_path_eligible(decision, artifacts)
+                )
+                if fast_path:
+                    log_info_event(
+                        logger,
+                        "[per] round-1 fast-path eligible — single "
+                        "component with [direct] evidence and no "
+                        "competing direct attribution; suspending "
+                        "structural-coverage gates",
+                        "per.pipeline.fast_path",
+                        leading_candidate=decision.leading_candidate,
+                        outlier_candidate=decision.outlier_candidate,
+                        proposed_mechanism=decision.proposed_mechanism,
+                    )
+                raw_violations = _finalize_gate_violations(
+                    decision, artifacts, fast_path=fast_path
+                )
                 critical, weak = _split_violations(raw_violations)
                 # Soft cap behaviour: past `finalize_gate_soft_cap_rounds`,
                 # drop WEAK violations only (scope coverage, audit
                 # completeness). CRITICAL violations — no [direct] fact
                 # for the candidate, missing mechanism, missing
                 # alternatives — stay binding regardless of round count,
-                # because accepting those past the soft cap would
-                # silently allow exactly the symptom-only /
-                # un-falsifiable mechanism finalization the gates exist
-                # to catch. Unbounded looping is bounded separately by
-                # `pipeline_wall_clock_budget_seconds` and
-                # `force_finalize_after_rounds` (which suspends gates).
+                # because accepting those past the soft cap would silently
+                # allow exactly the symptom-only / un-falsifiable mechanism
+                # finalization the gates exist to catch. Unbounded looping
+                # is bounded separately by `pipeline_wall_clock_budget_seconds`
+                # and `force_finalize_after_rounds` (which suspends gates
+                # entirely).
                 if weak and reflect_rounds >= _LIMITS.finalize_gate_soft_cap_rounds:
                     log_warning_event(
                         logger,
@@ -1746,7 +1838,9 @@ def create_per_agent(opensearch_url: str) -> Agent:
                         weak_violation_count=len(weak),
                         leading_candidate=decision.leading_candidate,
                     )
-                    pending_steps = _synthesize_followup_steps(decision, violations)
+                    pending_steps = _synthesize_followup_steps(
+                        decision, violations
+                    )
                     continue
 
                 total_ms = int((time.perf_counter() - pipeline_started) * 1000)
