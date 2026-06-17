@@ -45,7 +45,9 @@ from agents.per.sub_agents import (
     build_plan_agent,
     build_reflect_agent,
     set_mcp_client,
+    set_skills,
 )
+from agents.skills_loader import load_all_skills
 from server.constants import DEFAULT_MCP_SERVER_URL
 from utils.logging_helpers import get_logger, log_info_event, log_warning_event
 from utils.monitored_tool import monitored_tool
@@ -547,6 +549,12 @@ def create_per_agent(opensearch_url: str) -> Agent:
         "per_agent.mcp_created",
         mcp_server_url=mcp_server_url,
     )
+
+    # Load skills from ``skills/`` once at startup. The PER loop rebuilds
+    # plan/execute/reflect sub-agents on every iteration; ``set_skills``
+    # lets each builder attach a fresh ``AgentSkills`` plugin from this
+    # shared list without re-scanning the filesystem each time.
+    set_skills(load_all_skills(caller="per"))
 
     @monitored_tool(
         name="run_per_pipeline",

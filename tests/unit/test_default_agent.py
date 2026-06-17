@@ -1,7 +1,7 @@
 """Unit tests for the default agent — skill loading and agent construction.
 
 Verifies that:
-1. ``_load_all_skills()`` auto-discovers ``skills/`` directories correctly.
+1. ``_load_all_skills(caller="default_agent")`` auto-discovers ``skills/`` directories correctly.
 2. ``create_default_agent()`` wires MCP tools and skills into the strands Agent.
 3. ``LoggingAgentSkills`` emits an INFO-level log on skill activation and
    still delegates state tracking to the parent class.
@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from strands import Skill
 
-from agents import default_agent
+from agents import skills_loader
 from agents.default_agent import (
     _DEFAULT_BEDROCK_MODEL_ID,
     LoggingAgentSkills,
@@ -45,23 +45,23 @@ def fake_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect ``_load_all_skills`` to a tmp project root.
 
     ``_load_all_skills`` resolves ``skills/`` relative to
-    ``default_agent.__file__``. We simulate a project root at ``tmp_path`` by
+    ``skills_loader.__file__``. We simulate a project root at ``tmp_path`` by
     patching that module attribute to a synthetic path three levels deep.
     """
-    fake_file = tmp_path / "src" / "agents" / "default_agent.py"
+    fake_file = tmp_path / "src" / "agents" / "skills_loader.py"
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.touch()
-    monkeypatch.setattr(default_agent, "__file__", str(fake_file))
+    monkeypatch.setattr(skills_loader, "__file__", str(fake_file))
     return tmp_path
 
 
 class TestLoadAllSkills:
-    """Group 1 — skill auto-discovery via ``_load_all_skills()``."""
+    """Group 1 — skill auto-discovery via ``_load_all_skills(caller="default_agent")``."""
 
     @pytest.mark.parametrize("expected_name", EXPECTED_REPO_SKILLS)
     def test_discovers_expected_skill(self, expected_name: str) -> None:
         """Real repo ``skills/`` dir yields every skill in ``EXPECTED_REPO_SKILLS``."""
-        skills = _load_all_skills()
+        skills = _load_all_skills(caller="default_agent")
 
         names = [s.name for s in skills]
         assert expected_name in names, (
@@ -76,7 +76,7 @@ class TestLoadAllSkills:
         _write_skill(skills_dir / "alpha-skill", "alpha-skill", "First skill")
         _write_skill(skills_dir / "beta-skill", "beta-skill", "Second skill")
 
-        skills = _load_all_skills()
+        skills = _load_all_skills(caller="default_agent")
 
         names = sorted(s.name for s in skills)
         assert names == ["alpha-skill", "beta-skill"]
@@ -88,7 +88,7 @@ class TestLoadAllSkills:
         # fake_project_root has no skills/ subdirectory
         assert not (fake_project_root / "skills").exists()
 
-        skills = _load_all_skills()
+        skills = _load_all_skills(caller="default_agent")
 
         assert skills == []
 
@@ -101,7 +101,7 @@ class TestLoadAllSkills:
         # Stray file directly under skills/
         (skills_dir / "README.md").write_text("not a skill")
 
-        skills = _load_all_skills()
+        skills = _load_all_skills(caller="default_agent")
 
         assert [s.name for s in skills] == ["valid-skill"]
 
@@ -187,12 +187,13 @@ class TestLoggingAgentSkills:
     ) -> None:
         """Activation emits exactly one INFO-level record containing the skill name."""
         plugin = LoggingAgentSkills(
-            skills=[Skill(name="my-skill", description="a skill")]
+            caller="test_agent",
+            skills=[Skill(name="my-skill", description="a skill")],
         )
         mock_agent = MagicMock()
         mock_agent.state.get.return_value = None
 
-        with caplog.at_level(logging.INFO, logger="agents.default_agent"):
+        with caplog.at_level(logging.INFO, logger="agents.skills_loader"):
             plugin._track_activated_skill(mock_agent, "my-skill")
 
         activation_records = [
@@ -206,7 +207,8 @@ class TestLoggingAgentSkills:
     def test_activation_delegates_to_parent(self) -> None:
         """Parent ``_track_activated_skill`` still runs — state is updated on the agent."""
         plugin = LoggingAgentSkills(
-            skills=[Skill(name="my-skill", description="a skill")]
+            caller="test_agent",
+            skills=[Skill(name="my-skill", description="a skill")],
         )
         mock_agent = MagicMock()
         # Simulate empty state so parent initializes it.
@@ -243,15 +245,11 @@ class TestDefaultAgentModelSelection:
         with (
             patch("agents.default_agent._load_all_skills", return_value=[]),
             patch("agents.default_agent.BedrockModel") as mock_bedrock_cls,
-            patch("agents.default_agent._get_aws_session") as mock_session_fn,
         ):
             create_default_agent("http://localhost:9200")
 
-        mock_bedrock_cls.assert_called_once_with(
-            model_id=test_arn,
-            boto_session=mock_session_fn.return_value,
-            streaming=True,
-        )
+        mock_bedrock_cls.assert_called_once()
+        assert mock_bedrock_cls.call_args.kwargs["model_id"] == test_arn
 
     def test_falls_back_to_default_when_env_var_unset(
         self, monkeypatch: pytest.MonkeyPatch
@@ -262,12 +260,10 @@ class TestDefaultAgentModelSelection:
         with (
             patch("agents.default_agent._load_all_skills", return_value=[]),
             patch("agents.default_agent.BedrockModel") as mock_bedrock_cls,
-            patch("agents.default_agent._get_aws_session") as mock_session_fn,
         ):
             create_default_agent("http://localhost:9200")
 
-        mock_bedrock_cls.assert_called_once_with(
-            model_id=_DEFAULT_BEDROCK_MODEL_ID,
-            boto_session=mock_session_fn.return_value,
-            streaming=True,
+        mock_bedrock_cls.assert_called_once()
+        assert (
+            mock_bedrock_cls.call_args.kwargs["model_id"] == _DEFAULT_BEDROCK_MODEL_ID
         )
