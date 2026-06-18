@@ -13,10 +13,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     create_engine,
@@ -113,6 +115,90 @@ class Message(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Investigation memory tables.
+#
+# Mirror the ml-commons ``memory_containers`` JSON shape so the OSD
+# ``dashboards-investigation`` frontend can poll agent-server with the same
+# client code it uses against ml-commons. ``structured_data_blob``,
+# ``namespace`` and ``metadata`` are stored as JSON text — schema-flexible,
+# and the small subset of filters the frontend actually issues
+# (``namespace.session_id`` term + ``metadata.type`` exclusion) is served
+# by promoted columns ``session_id`` / ``metadata_type``.
+# ---------------------------------------------------------------------------
+
+
+class MemoryContainerRow(Base):
+    """One investigation container — owned by a user."""
+
+    __tablename__ = "memory_containers"
+
+    container_id = Column(String, primary_key=True)
+    name = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
+    owner_user_id = Column(String, nullable=True)
+    created_time = Column(String, nullable=False)
+
+
+class MemorySessionRow(Base):
+    """Executor session inside a container.
+
+    The frontend polls strictly by ``namespace.session_id`` — one
+    session per investigation keeps concurrent runs on the same
+    container from bleeding into each other's trace stream.
+    """
+
+    __tablename__ = "memory_sessions"
+
+    session_id = Column(String, primary_key=True)
+    container_id = Column(
+        String,
+        ForeignKey("memory_containers.container_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_time = Column(String, nullable=False)
+
+
+class MemoryMessageRow(Base):
+    """Trace or terminal message — the unit the frontend polls.
+
+    ``insert_seq`` is a per-process monotonically increasing counter
+    used as the secondary sort key after ``created_time``, since the
+    latter only has millisecond resolution and the orchestrator can
+    commit several writes inside one ms (reflect → final on the same
+    tick). The frontend renders strictly by ``created_time asc`` and
+    has no per-step sequence number, so any tie ambiguity garbles the
+    trace.
+
+    ``trace_number`` is promoted to a column so trace pagination can
+    sort by it (matching ml-commons, where the analogous ``message_id``
+    integer column is the sort key — see
+    ``getMLCommonsAgenticTracesMessages`` in ``ml_commons_apis.ts``).
+    Null for terminal messages.
+    """
+
+    __tablename__ = "memory_messages"
+
+    message_id = Column(String, primary_key=True)
+    memory_container_id = Column(String, nullable=False)
+    session_id = Column(String, nullable=False)
+    metadata_type = Column(String, nullable=False)  # "trace" or "message"
+    structured_data_blob = Column(Text, nullable=False)  # JSON string
+    namespace = Column(Text, nullable=False)  # JSON string
+    metadata_json = Column("metadata", Text, nullable=False)  # JSON string
+    infer = Column(Boolean, nullable=False, default=False)
+    created_time = Column(String, nullable=False)
+    last_updated_time = Column(String, nullable=False)
+    insert_seq = Column(Integer, nullable=False)
+    trace_number = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("idx_mem_msg_session_seq", "session_id", "insert_seq"),
+        Index("idx_mem_msg_container_session", "memory_container_id", "session_id"),
+        Index("idx_mem_msg_trace_number", "session_id", "trace_number"),
+    )
+
+
 class Event(Base):
     """Event (AG-UI protocol event) table."""
 
@@ -170,12 +256,31 @@ class AGUIPersistence:
         # Create session factory
         self.SessionLocal = sessionmaker(bind=self.engine)
 
+        # Lazy memory-store handle. The investigation feature reads this
+        # via :meth:`memory_store` so the routes can share the engine
+        # without circular-importing storage.* at module load time.
+        self._memory_store = None
+
         log_info_event(
             logger,
             "✓ AG-UI database initialized.",
             "persistence.db_initialized",
             db_path=self.db_path,
         )
+
+    @property
+    def memory_store(self):
+        """Investigation memory store bound to this persistence's engine.
+
+        Imported lazily — :mod:`storage.sqlite_store` imports back from
+        this module to reuse the ``Base`` and ORM classes, so a
+        top-level import would cycle.
+        """
+        if self._memory_store is None:
+            from storage.sqlite_store import SqliteMemoryStore
+
+            self._memory_store = SqliteMemoryStore.from_engine(self.engine)
+        return self._memory_store
 
     def _ensure_db_directory(self) -> None:
         """Ensure the database directory exists."""
