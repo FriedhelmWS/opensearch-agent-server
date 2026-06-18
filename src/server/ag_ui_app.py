@@ -270,11 +270,17 @@ def create_app(config_override: ServerConfig | None = None) -> FastAPI:
 
         global persistence, orchestrator
         persistence = None
+        app.state.memory_store = None
         if config_resolved.enable_persistence:
             try:
                 from utils.persistence import AGUIPersistence
 
                 persistence = AGUIPersistence(db_path=config_resolved.db_path)
+                # Investigation memory shares the AG-UI engine. Exposing
+                # it on app.state lets the memory_containers /
+                # per_investigations routes resolve the store via
+                # Depends without a global.
+                app.state.memory_store = persistence.memory_store
                 log_info_event(
                     logger,
                     "✓ AG-UI data persistence enabled",
@@ -292,6 +298,7 @@ def create_app(config_override: ServerConfig | None = None) -> FastAPI:
                     enabled=False,
                 )
                 persistence = None
+                app.state.memory_store = None
         else:
             log_info_event(
                 logger,
@@ -485,6 +492,15 @@ def create_app(config_override: ServerConfig | None = None) -> FastAPI:
     app.add_middleware(
         _MaxBodySizeMiddleware, max_bytes=config_resolved.max_request_body_bytes
     )
+
+    # Investigation feature: ml-commons-shaped memory_containers routes
+    # + the PER trigger route. Both depend on
+    # ``app.state.memory_store`` being set during lifespan startup.
+    from server.memory_routes import router as memory_router
+    from server.per_investigation_routes import router as investigations_router
+
+    app.include_router(memory_router)
+    app.include_router(investigations_router)
 
     return app
 
