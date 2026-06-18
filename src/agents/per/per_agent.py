@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
+import re
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Literal
 
 import boto3
 import httpx
@@ -60,6 +63,34 @@ _DEFAULT_BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 
 # Mirrors DEFAULT_MAX_STEPS_EXECUTED in MLPlanExecuteAndReflectAgentRunner.java.
 _MAX_STEPS = 20
+
+
+@dataclass(frozen=True)
+class PhaseEvent:
+    """One observation point in the PER pipeline.
+
+    Emitted to a caller-supplied ``on_phase`` callback after each
+    plan / execute / reflect sub-agent invocation, plus a final
+    ``"final"`` event carrying the pipeline's return string. Pure data
+    — the callback decides what (if anything) to persist.
+
+    ``input`` and ``response`` are the prompt and raw text the sub-agent
+    saw / produced. For ``phase == "final"``, ``input`` is the original
+    problem statement and ``response`` is the pipeline return value.
+
+    ``step_index`` is 0 for plan, 1..N for each execute step, and the
+    matching reflect call uses the same index as the last execute step
+    in its batch (mirrors the existing ``_run_phase`` numbering).
+    """
+
+    phase: Literal["plan", "execute", "reflect", "final"]
+    step_index: int
+    input: str
+    response: str
+
+
+OnPhase = Callable[[PhaseEvent], Awaitable[None]]
+"""Optional async hook fired after each PER phase. ``None`` = no-op."""
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are an OpenSearch root-cause-analysis assistant
 for the Explore page.
@@ -499,6 +530,249 @@ async def _run_phase(agent: Agent, prompt: str, phase: str, step_index: int):
     return result, elapsed_ms, tokens_in, tokens_out, usage
 
 
+async def run_per_pipeline_core(
+    problem_statement: str,
+    *,
+    on_phase: OnPhase | None = None,
+) -> str:
+    """Run the plan→execute→reflect loop and return the final report.
+
+    Module-level entry point shared by the orchestrator's MCP tool
+    (:func:`create_per_agent`) and the investigation
+    :class:`~agents.investigation.per_backend.PERBackend`. Behaviour is
+    identical when ``on_phase`` is ``None`` — the parameter is the only
+    new surface.
+
+    Pre-conditions: :func:`~agents.per.sub_agents.set_mcp_client` and
+    :func:`~agents.per.sub_agents.set_skills` have been called (the PER
+    sub-agent builders read from those module-level slots). ``create_per_agent``
+    handles this during startup; tests may stub them directly.
+
+    Args:
+        problem_statement: User-supplied root-cause-analysis problem.
+        on_phase: Optional async callback fired after each plan/execute/
+            reflect sub-agent invocation, plus a terminal ``"final"``
+            event carrying the pipeline's return string. Exceptions
+            raised here are intentionally NOT caught — the caller (e.g.
+            an orchestrator that needs to write a memory message)
+            decides whether a hook failure should abort the pipeline.
+    """
+    artifacts = ArtifactStore()
+    pipeline_started = time.perf_counter()
+
+    async def _emit(phase: str, step_index: int, input_: str, response: str) -> None:
+        if on_phase is not None:
+            await on_phase(
+                PhaseEvent(
+                    phase=phase,  # type: ignore[arg-type]
+                    step_index=step_index,
+                    input=input_,
+                    response=response,
+                )
+            )
+
+    usage_totals = {
+        "input": 0,
+        "output": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "phase_calls": 0,
+        "by_phase": {
+            "plan": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
+            "execute": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
+            "reflect": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
+        },
+    }
+
+    def _accumulate(usage: dict, phase: str) -> None:
+        for k in ("input", "output", "cache_read", "cache_write"):
+            usage_totals[k] += int(usage.get(k, 0))
+        usage_totals["phase_calls"] += 1
+        bucket = usage_totals["by_phase"].setdefault(
+            phase, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
+        )
+        for k in ("input", "output", "cache_read", "cache_write"):
+            bucket[k] += int(usage.get(k, 0))
+        bucket["calls"] += 1
+
+    def _publish() -> None:
+        denom = usage_totals["input"] + usage_totals["cache_read"] + usage_totals["cache_write"]
+        cache_hit_ratio = (
+            round(usage_totals["cache_read"] / denom, 4) if denom else 0.0
+        )
+        publish_inner_usage(
+            {
+                "schema_version": 1,
+                "input": usage_totals["input"],
+                "output": usage_totals["output"],
+                "cache_read": usage_totals["cache_read"],
+                "cache_write": usage_totals["cache_write"],
+                "cache_hit_ratio": cache_hit_ratio,
+                "phase_calls": usage_totals["phase_calls"],
+                "by_phase": usage_totals["by_phase"],
+            }
+        )
+
+    log_info_event(
+        logger,
+        "[per] pipeline start",
+        "per.pipeline.start",
+        problem_statement=problem_statement[:200],
+    )
+
+    plan_agent = build_plan_agent()
+    plan_result, _, _, _, plan_usage = await _run_phase(
+        plan_agent, problem_statement, "plan", step_index=0
+    )
+    _accumulate(plan_usage, "plan")
+    plan_text = str(plan_result)
+    await _emit("plan", 0, problem_statement, plan_text)
+    plan_steps, plan_final = _parse_planner_output(plan_text)
+
+    if plan_final:
+        log_info_event(
+            logger,
+            "[per] planner returned final result without execution",
+            "per.pipeline.early_finish",
+            phase="plan",
+        )
+        _publish()
+        await _emit("final", 0, problem_statement, plan_final)
+        return plan_final
+
+    if not plan_steps:
+        log_warning_event(
+            logger,
+            "[per] planner emitted no steps and no result; aborting",
+            "per.pipeline.empty_plan",
+        )
+        _publish()
+        msg = f"Planner produced no actionable plan.\n\nRaw output:\n{plan_result}"
+        await _emit("final", 0, problem_statement, msg)
+        return msg
+
+    pending_steps: list[str] = [plan_steps[0]]
+    last_reflect_text = ""
+    steps_executed = 0
+
+    while pending_steps and steps_executed < _MAX_STEPS:
+        batch = pending_steps[: max(1, _MAX_STEPS - steps_executed)]
+        batch_size = len(batch)
+        batch_started = time.perf_counter()
+        execute_prompts = [_build_execute_input(s, artifacts) for s in batch]
+        execute_agents = [build_execute_agent() for _ in batch]
+
+        log_info_event(
+            logger,
+            f"[per] dispatching execute batch of {batch_size}",
+            "per.pipeline.execute_batch_dispatch",
+            batch_size=batch_size,
+            first_step_index=steps_executed + 1,
+        )
+
+        exec_outcomes = await asyncio.gather(
+            *(
+                _run_phase(agent, prompt, "execute", steps_executed + 1 + i)
+                for i, (agent, prompt) in enumerate(zip(execute_agents, execute_prompts))
+            )
+        )
+
+        # Sequential post-processing — artifacts.add() and the on_phase
+        # callback both mutate state that downstream batches read, so
+        # serialize commit even though the LLM calls ran in parallel.
+        # This also guarantees the orchestrator's memory writes land in
+        # plan-step order (the frontend renders strictly by created_time
+        # ascending and has no per-step sequence number to recover from).
+        for i, (step_text, outcome) in enumerate(zip(batch, exec_outcomes)):
+            exec_result, exec_ms, exec_in, exec_out, exec_usage = outcome
+            _accumulate(exec_usage, "execute")
+            step_index = steps_executed + 1 + i
+            raw_findings = str(exec_result)
+            findings, queries, facts = _extract_sections(raw_findings)
+            artifacts.add(
+                step_index=step_index,
+                step_intent=step_text,
+                findings=findings,
+                facts=facts,
+                queries=queries,
+                tokens_in=exec_in,
+                tokens_out=exec_out,
+                elapsed_ms=exec_ms,
+            )
+            log_info_event(
+                logger,
+                f"[per] captured {len(facts)} fact(s) and {len(queries)} query(s) from step {step_index}",
+                "per.pipeline.facts_captured",
+                step_index=step_index,
+                fact_count=len(facts),
+                query_count=len(queries),
+            )
+            await _emit("execute", step_index, step_text, raw_findings)
+
+        steps_executed += batch_size
+        batch_elapsed_ms = int((time.perf_counter() - batch_started) * 1000)
+        log_info_event(
+            logger,
+            f"[per] execute batch complete ({batch_size} step(s))",
+            "per.pipeline.execute_batch_complete",
+            batch_size=batch_size,
+            batch_elapsed_ms=batch_elapsed_ms,
+        )
+
+        reflect_agent = build_reflect_agent()
+        reflect_prompt = _build_reflect_input(
+            objective=problem_statement,
+            plan_steps=plan_steps,
+            artifacts=artifacts,
+            latest_n=batch_size,
+        )
+        reflect_result, _, _, _, reflect_usage = await _run_phase(
+            reflect_agent, reflect_prompt, "reflect", steps_executed
+        )
+        _accumulate(reflect_usage, "reflect")
+        last_reflect_text = str(reflect_result)
+        await _emit("reflect", steps_executed, reflect_prompt, last_reflect_text)
+        next_steps, final_result = _parse_reflect_output(last_reflect_text)
+
+        if final_result:
+            total_ms = int((time.perf_counter() - pipeline_started) * 1000)
+            log_info_event(
+                logger,
+                "[per] pipeline complete",
+                "per.pipeline.finish",
+                steps_executed=steps_executed,
+                total_elapsed_ms=total_ms,
+            )
+            _publish()
+            await _emit("final", steps_executed, problem_statement, final_result)
+            return final_result
+
+        if not next_steps:
+            log_warning_event(
+                logger,
+                "[per] reflector returned no next_steps and no result",
+                "per.pipeline.unparseable_reflect",
+                steps_executed=steps_executed,
+            )
+            break
+
+        pending_steps = next_steps
+
+    log_warning_event(
+        logger,
+        "[per] max steps reached without final result",
+        "per.pipeline.max_steps",
+        max_steps=_MAX_STEPS,
+    )
+    _publish()
+    msg = (
+        f"Max Steps Limit ({_MAX_STEPS}) Reached. Use the same conversation "
+        f"to continue.\n\nLast reflection:\n{last_reflect_text or '(no reflection)'}"
+    )
+    await _emit("final", steps_executed, problem_statement, msg)
+    return msg
+
+
 def create_per_agent(opensearch_url: str) -> Agent:
     """Create the PER orchestrator agent.
 
@@ -567,233 +841,7 @@ def create_per_agent(opensearch_url: str) -> Agent:
         ),
     )
     async def run_per_pipeline(problem_statement: str) -> str:
-        artifacts = ArtifactStore()
-        pipeline_started = time.perf_counter()
-
-        # Accumulator for Bedrock-reported token usage across every
-        # sub-agent call this pipeline makes (plan + each reflect + each
-        # executor sub-agent + their nested tool-use turns). Sub-agent
-        # traffic is invisible to the outer orchestrator's
-        # ``event_loop_metrics.accumulated_usage``; without this the
-        # CustomEvent emitted by the orchestrator under-counts the PER
-        # pipeline by ~40×. Two views are maintained:
-        #   - top-level totals (input / output / cache_read / cache_write)
-        #   - by_phase breakdown (plan / execute / reflect, with call counts)
-        # ``_publish`` is wired into every return path so the
-        # ContextVar handoff to the orchestrator never gets skipped.
-        usage_totals = {
-            "input": 0,
-            "output": 0,
-            "cache_read": 0,
-            "cache_write": 0,
-            "phase_calls": 0,
-            "by_phase": {
-                "plan": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
-                "execute": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
-                "reflect": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
-            },
-        }
-
-        def _accumulate(usage: dict, phase: str) -> None:
-            for k in ("input", "output", "cache_read", "cache_write"):
-                usage_totals[k] += int(usage.get(k, 0))
-            usage_totals["phase_calls"] += 1
-            bucket = usage_totals["by_phase"].setdefault(
-                phase, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0},
-            )
-            for k in ("input", "output", "cache_read", "cache_write"):
-                bucket[k] += int(usage.get(k, 0))
-            bucket["calls"] += 1
-
-        def _publish() -> None:
-            denom = usage_totals["input"] + usage_totals["cache_read"] + usage_totals["cache_write"]
-            cache_hit_ratio = (
-                round(usage_totals["cache_read"] / denom, 4) if denom else 0.0
-            )
-            # ``publish_inner_usage`` MUTATES the orchestrator-installed
-            # container in place — calling ``ContextVar.set`` here would
-            # rebind only inside Strands' per-tool context copy and the
-            # orchestrator would never see it (this is the bug that made
-            # earlier runs report inner={0,0,0,0} despite the pipeline
-            # actually spending 5K+ tokens per request).
-            publish_inner_usage(
-                {
-                    "schema_version": 1,
-                    "input": usage_totals["input"],
-                    "output": usage_totals["output"],
-                    "cache_read": usage_totals["cache_read"],
-                    "cache_write": usage_totals["cache_write"],
-                    "cache_hit_ratio": cache_hit_ratio,
-                    "phase_calls": usage_totals["phase_calls"],
-                    "by_phase": usage_totals["by_phase"],
-                }
-            )
-
-        log_info_event(
-            logger,
-            "[per] pipeline start",
-            "per.pipeline.start",
-            problem_statement=problem_statement[:200],
-        )
-
-        # ---- Plan phase --------------------------------------------------
-        plan_agent = build_plan_agent()
-        plan_result, _, _, _, plan_usage = await _run_phase(
-            plan_agent, problem_statement, "plan", step_index=0
-        )
-        _accumulate(plan_usage, "plan")
-        plan_steps, plan_final = _parse_planner_output(str(plan_result))
-
-        if plan_final:
-            # Planner answered directly without needing execution.
-            log_info_event(
-                logger,
-                "[per] planner returned final result without execution",
-                "per.pipeline.early_finish",
-                phase="plan",
-            )
-            _publish()
-            return plan_final
-
-        if not plan_steps:
-            log_warning_event(
-                logger,
-                "[per] planner emitted no steps and no result; aborting",
-                "per.pipeline.empty_plan",
-            )
-            _publish()
-            return f"Planner produced no actionable plan.\n\nRaw output:\n{plan_result}"
-
-        # ---- Execute / Reflect loop -------------------------------------
-        # The executor and reflector are rebuilt fresh each iteration so
-        # their conversation history does not carry across steps. Cross-step
-        # state is reintroduced explicitly via ``ArtifactStore``:
-        #   - ``compact_table()`` for the (truncated) intent/summary trail,
-        #   - ``all_facts()`` for full-fidelity KNOWN_FACTS that the executor
-        #     and reflector both rely on to avoid rediscovering schema or
-        #     re-issuing ruled-out hypotheses.
-        # The reflector emits ``next_steps`` (a list — diff-only) instead of
-        # rewriting the entire remaining plan each iteration, which is what
-        # keeps reflect-output token cost bounded. When the reflector returns
-        # ``len(next_steps) > 1`` it has decided those steps are independent,
-        # and we fan them out via ``asyncio.gather`` to compress wall-clock.
-        pending_steps: list[str] = [plan_steps[0]]
-        last_reflect_text = ""
-        steps_executed = 0
-
-        while pending_steps and steps_executed < _MAX_STEPS:
-            batch = pending_steps[: max(1, _MAX_STEPS - steps_executed)]
-            batch_size = len(batch)
-            batch_started = time.perf_counter()
-            # Snapshot the artifact-derived KNOWN_FACTS once and reuse it for
-            # every sibling in the batch. They share state at dispatch time
-            # by design — they're declared independent.
-            execute_prompts = [_build_execute_input(s, artifacts) for s in batch]
-            execute_agents = [build_execute_agent() for _ in batch]
-
-            log_info_event(
-                logger,
-                f"[per] dispatching execute batch of {batch_size}",
-                "per.pipeline.execute_batch_dispatch",
-                batch_size=batch_size,
-                first_step_index=steps_executed + 1,
-            )
-
-            exec_outcomes = await asyncio.gather(
-                *(
-                    _run_phase(agent, prompt, "execute", steps_executed + 1 + i)
-                    for i, (agent, prompt) in enumerate(zip(execute_agents, execute_prompts))
-                )
-            )
-
-            for i, (step_text, outcome) in enumerate(zip(batch, exec_outcomes)):
-                exec_result, exec_ms, exec_in, exec_out, exec_usage = outcome
-                _accumulate(exec_usage, "execute")
-                step_index = steps_executed + 1 + i
-                raw_findings = str(exec_result)
-                findings, queries, facts = _extract_sections(raw_findings)
-                artifacts.add(
-                    step_index=step_index,
-                    step_intent=step_text,
-                    findings=findings,
-                    facts=facts,
-                    queries=queries,
-                    tokens_in=exec_in,
-                    tokens_out=exec_out,
-                    elapsed_ms=exec_ms,
-                )
-                log_info_event(
-                    logger,
-                    f"[per] captured {len(facts)} fact(s) and {len(queries)} query(s) from step {step_index}",
-                    "per.pipeline.facts_captured",
-                    step_index=step_index,
-                    fact_count=len(facts),
-                    query_count=len(queries),
-                )
-
-            steps_executed += batch_size
-            batch_elapsed_ms = int((time.perf_counter() - batch_started) * 1000)
-            log_info_event(
-                logger,
-                f"[per] execute batch complete ({batch_size} step(s))",
-                "per.pipeline.execute_batch_complete",
-                batch_size=batch_size,
-                batch_elapsed_ms=batch_elapsed_ms,
-            )
-
-            reflect_agent = build_reflect_agent()
-            # Show the reflector full findings for every artifact in the
-            # batch we just completed, not just the most recent one — they
-            # were dispatched as a unit and must be reasoned about as a unit.
-            reflect_prompt = _build_reflect_input(
-                objective=problem_statement,
-                plan_steps=plan_steps,
-                artifacts=artifacts,
-                latest_n=batch_size,
-            )
-            reflect_result, _, _, _, reflect_usage = await _run_phase(
-                reflect_agent, reflect_prompt, "reflect", steps_executed
-            )
-            _accumulate(reflect_usage, "reflect")
-            last_reflect_text = str(reflect_result)
-            next_steps, final_result = _parse_reflect_output(last_reflect_text)
-
-            if final_result:
-                total_ms = int((time.perf_counter() - pipeline_started) * 1000)
-                log_info_event(
-                    logger,
-                    "[per] pipeline complete",
-                    "per.pipeline.finish",
-                    steps_executed=steps_executed,
-                    total_elapsed_ms=total_ms,
-                )
-                _publish()
-                return final_result
-
-            if not next_steps:
-                log_warning_event(
-                    logger,
-                    "[per] reflector returned no next_steps and no result",
-                    "per.pipeline.unparseable_reflect",
-                    steps_executed=steps_executed,
-                )
-                break
-
-            pending_steps = next_steps
-
-        # Loop exhausted without a final result — mirror the Java runner's
-        # "Max Steps Limit" message and surface the last reflector output.
-        log_warning_event(
-            logger,
-            "[per] max steps reached without final result",
-            "per.pipeline.max_steps",
-            max_steps=_MAX_STEPS,
-        )
-        _publish()
-        return (
-            f"Max Steps Limit ({_MAX_STEPS}) Reached. Use the same conversation "
-            f"to continue.\n\nLast reflection:\n{last_reflect_text or '(no reflection)'}"
-        )
+        return await run_per_pipeline_core(problem_statement)
 
     orchestrator_model = BedrockModel(
         model_id=os.environ["BEDROCK_INFERENCE_PROFILE_ARN"],
