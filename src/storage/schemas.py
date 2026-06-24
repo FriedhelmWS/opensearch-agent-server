@@ -65,7 +65,12 @@ class MessageMetadata(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["trace", "message"]
+    # ``"trace"`` / ``"message"`` follow ml-commons; ``"phase"`` is
+    # an agent-server addition for the high-level run-state row that
+    # the OSD frontend polls by id (``_phase_message_id``) to render
+    # the live investigation phase indicator. Kept out of step-list
+    # / trace-flyout polling shapes by virtue of the dedicated id.
+    type: Literal["trace", "message", "phase"]
     parent_message_id: str | None = None
     trace_number: str | None = None
     origin: str | None = None

@@ -36,6 +36,26 @@ class MemoryStore(Protocol):
         by ``created_time asc``.
         """
 
+    def update_message_response(
+        self,
+        *,
+        container_id: str,
+        message_id: str,
+        response: str,
+        last_updated_time: str,
+    ) -> None:
+        """Update an existing message's ``structured_data_blob.response``.
+
+        Used to turn an in-flight step (written with ``response=""``)
+        into a completed one. The OSD frontend uses an empty
+        ``response`` on the last message to decide "still running" —
+        flipping it to non-empty here is what makes the spinner go
+        green. ``last_updated_time`` is the new top-level timestamp.
+        Implementations MUST be a no-op when ``message_id`` is unknown
+        (defensive — caller is the orchestrator, races with
+        cancellation are possible).
+        """
+
     def search_messages(
         self,
         *,

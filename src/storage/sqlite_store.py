@@ -161,6 +161,35 @@ class SqliteMemoryStore(MemoryStore):
         finally:
             session.close()
 
+    def update_message_response(
+        self,
+        *,
+        container_id: str,
+        message_id: str,
+        response: str,
+        last_updated_time: str,
+    ) -> None:
+        session = self._SessionLocal()
+        try:
+            row = (
+                session.query(MemoryMessageRow)
+                .filter(
+                    MemoryMessageRow.memory_container_id == container_id,
+                    MemoryMessageRow.message_id == message_id,
+                )
+                .first()
+            )
+            if row is None:
+                return
+            blob = json.loads(row.structured_data_blob)
+            blob["response"] = response
+            blob["updated_time"] = last_updated_time
+            row.structured_data_blob = json.dumps(blob)
+            row.last_updated_time = last_updated_time
+            session.commit()
+        finally:
+            session.close()
+
     def search_messages(
         self,
         *,
