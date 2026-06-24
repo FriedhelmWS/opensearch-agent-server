@@ -13,7 +13,10 @@ from pydantic import BaseModel, Field
 class PERAgentHypothesisFinding(BaseModel):
     id: str
     description: str
-    importance: str | None = None
+    # OSD validator requires ``importance: number`` and
+    # ``evidence: string``. Accept None for permissive ingest, then
+    # sanitize via ``model_dump`` / the backend's _sanitize step.
+    importance: int | None = None
     evidence: str | None = None
     type: str | None = None
 
@@ -22,22 +25,45 @@ class PERAgentHypothesisItem(BaseModel):
     id: str
     title: str
     description: str
-    likelihood: str | None = None
+    # OSD's ``isValidPERAgentHypothesisItem`` requires
+    # ``typeof likelihood === 'number'``. We accept None on parse
+    # (some models emit null) then coerce to 0 at output time.
+    likelihood: int | None = None
     supporting_findings: list[str] = Field(default_factory=list)
 
 
 class PERAgentTopologyNode(BaseModel):
+    """Topology node shape required by OSD's
+    ``/api/investigation/note/updateHypotheses`` route schema.
+
+    All five fields are strict ``string`` on the OSD side; ``parentId``
+    is nullable. We accept ``None`` on parse so a slightly malformed
+    model output doesn't crash the whole response, then the backend's
+    ``_sanitize_for_osd`` step fills missing strings with ``""`` so
+    the row still passes the OSD route validator.
+    """
+
     id: str
-    label: str | None = None
-    type: str | None = None
+    name: str | None = None
+    startTime: str | None = None
+    duration: str | None = None
+    status: str | None = None
+    parentId: str | None = None
 
 
 class PERAgentTopology(BaseModel):
+    """Topology shape required by OSD's updateHypotheses route schema.
+
+    ``description`` and ``traceId`` are strict ``string`` on the OSD
+    side. Same pattern as the node: permissive on parse, sanitized
+    to ``""`` before persisting.
+    """
+
     id: str
     description: str | None = None
     traceId: str | None = None
-    nodes: list[PERAgentTopologyNode] = Field(default_factory=list)
     hypothesisIds: list[str] = Field(default_factory=list)
+    nodes: list[PERAgentTopologyNode] = Field(default_factory=list)
 
 
 class PERAgentInvestigationResponse(BaseModel):

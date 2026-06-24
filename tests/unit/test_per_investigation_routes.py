@@ -114,19 +114,18 @@ def test_background_run_writes_terminal_message(
     # The TestClient runs each request synchronously on a fresh loop, so
     # by the time we reach this point the background task has already
     # been scheduled but may not have run. Drain it by polling the
-    # store. A handful of iterations is plenty for the scripted backend.
+    # store by message_id — this mirrors what the OSD frontend does
+    # via ``getFinalMessage``, which is independent of which session
+    # the terminal landed in.
     import time
 
     deadline = time.monotonic() + 2.0
     terminal = None
     while time.monotonic() < deadline:
-        msgs, _ = store.search_messages(
-            container_id=container_id,
-            session_id=session_id,
-            exclude_trace=True,
+        terminal = store.get_message_by_id(
+            container_id=container_id, message_id=parent_msg_id
         )
-        if msgs:
-            terminal = msgs[0]
+        if terminal is not None:
             break
         time.sleep(0.02)
 
@@ -136,6 +135,15 @@ def test_background_run_writes_terminal_message(
         terminal.structured_data_blob.response
     )
     assert decoded.investigationName == "ok"
+    # Terminal must NOT land in the executor session — otherwise the
+    # OSD step list, which polls only that session, renders the
+    # terminal as a fake last step titled with the user's question.
+    exec_msgs, _ = store.search_messages(
+        container_id=container_id,
+        session_id=session_id,
+        exclude_trace=True,
+    )
+    assert all(m.message_id != parent_msg_id for m in exec_msgs)
 
 
 def test_503_when_store_unavailable() -> None:

@@ -1,34 +1,44 @@
 """Normalized event stream produced by an :class:`InvestigationBackend`.
 
 The orchestrator consumes ``TraceEvent`` and ``FinalEvent`` instances
-without caring which backend produced them. PER backends emit one
-``TraceEvent`` per plan/execute/reflect phase; future backends (e.g. a
-default-agent backend) emit one ``TraceEvent`` per tool call.
+without caring which backend produced them. PER backends emit
+``TraceEvent`` for each step plus one per inner LLM call / tool call
+within the step; future backends (e.g. a default-agent backend) emit
+one ``TraceEvent`` per tool call.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 from agents.investigation.response_schema import PERAgentInvestigationResponse
-
-TraceOrigin = Literal["plan", "execute", "reflect", "tool"]
 
 
 @dataclass(frozen=True)
 class TraceEvent:
-    """A single intermediate step the agent took.
+    """A single intermediate event the agent emitted.
 
-    ``origin`` distinguishes phase-shaped backends (PER) from
-    tool-shaped ones (default-agent). The orchestrator passes it
-    straight through to ``structured_data_blob.origin`` so the frontend
-    can group trace messages by phase.
+    ``origin`` is free-form — it doubles as the
+    ``structured_data_blob.origin`` value the frontend reads. Common
+    values:
+      - ``"execute"`` — a top-level step the user sees in the step list
+      - ``"LLM"``     — a sub-agent's LLM call inside a step
+      - ``"<tool>"``  — a tool invocation inside a step (e.g.
+        ``"SearchIndexTool"``); matches the ml-commons
+        ``saveTraceData(origin=lastAction)`` convention so imported
+        history renders identically.
+
+    ``step_index`` is non-zero for events that should attach to a
+    particular execute step. Inner trace events (LLM / tool) carry
+    their parent step's index so the orchestrator can route them
+    under the correct step's message_id. ``0`` means "no step parent
+    — root-level event"; the orchestrator is free to ignore those.
     """
 
-    origin: TraceOrigin
+    origin: str
     input: str
     response: str
+    step_index: int = 0
 
 
 @dataclass(frozen=True)

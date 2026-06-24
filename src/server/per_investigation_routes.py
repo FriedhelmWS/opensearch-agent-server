@@ -79,6 +79,18 @@ async def trigger_investigation(
             name="investigation"
         ).container_id
 
+    # Two sessions per ml-commons:
+    #   planner session — owns the parent_interaction terminal message
+    #   executor session (a.k.a. executor_memory_id) — owns per-step
+    #       rows + their inner LLM/tool traces; the OSD step list
+    #       polls this one.
+    # Keeping the terminal out of the executor session is what
+    # prevents the user's original question from rendering as a fake
+    # "last step" in the step list.
+    parent_session_id = store.create_session(
+        container_id=container_id
+    ).session_id
+
     session_id = body.executor_memory_id
     if session_id is None:
         session_id = store.create_session(container_id=container_id).session_id
@@ -89,6 +101,7 @@ async def trigger_investigation(
         container_id=container_id,
         session_id=session_id,
         parent_message_id=parent_message_id,
+        parent_session_id=parent_session_id,
     )
     ctx = InvestigationContext(
         question=body.question,
