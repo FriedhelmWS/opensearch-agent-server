@@ -32,7 +32,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import boto3
 import httpx
@@ -83,10 +83,22 @@ class PhaseEvent:
     in its batch (mirrors the existing ``_run_phase`` numbering).
     """
 
-    phase: Literal["plan", "execute", "reflect", "final"]
+    phase: Literal[
+        "plan",
+        "execute_start",  # step dispatched, executor sub-agent now running
+        "execute",        # step finished — final response from executor
+        "execute_inner",  # LLM call / tool call inside an execute step
+        "reflect",
+        "final",
+    ]
     step_index: int
     input: str
     response: str
+    # For ``execute_inner`` events, names what the inner activity was:
+    #   - ``"llm"``                        a model call
+    #   - ``"tool:<tool_name>"``           a tool invocation
+    # ``None`` for the outer phases (plan / execute / reflect / final).
+    inner_origin: str | None = None
 
 
 OnPhase = Callable[[PhaseEvent], Awaitable[None]]
@@ -534,6 +546,7 @@ async def run_per_pipeline_core(
     problem_statement: str,
     *,
     on_phase: OnPhase | None = None,
+    extra_reflect_system_prompt: str | None = None,
 ) -> str:
     """Run the plan→execute→reflect loop and return the final report.
 
@@ -556,11 +569,23 @@ async def run_per_pipeline_core(
             raised here are intentionally NOT caught — the caller (e.g.
             an orchestrator that needs to write a memory message)
             decides whether a hook failure should abort the pipeline.
+        extra_reflect_system_prompt: Optional string appended to the
+            reflect sub-agent's system prompt. Lets a caller inject
+            domain-specific output requirements (e.g. structured final
+            result schema for the investigation backend) without
+            modifying the generic PER framework. Plan and execute
+            sub-agents are unaffected.
     """
     artifacts = ArtifactStore()
     pipeline_started = time.perf_counter()
 
-    async def _emit(phase: str, step_index: int, input_: str, response: str) -> None:
+    async def _emit(
+        phase: str,
+        step_index: int,
+        input_: str,
+        response: str,
+        inner_origin: str | None = None,
+    ) -> None:
         if on_phase is not None:
             await on_phase(
                 PhaseEvent(
@@ -568,8 +593,93 @@ async def run_per_pipeline_core(
                     step_index=step_index,
                     input=input_,
                     response=response,
+                    inner_origin=inner_origin,
                 )
             )
+
+    # Bridge from Strands' Agent hooks (called synchronously, possibly
+    # from the MCP background thread) to ``on_phase`` (async, runs on
+    # the pipeline's event loop). We capture a reference to the
+    # running loop and use ``asyncio.run_coroutine_threadsafe`` so
+    # tool-call hooks fired off-thread land back on the pipeline's
+    # loop. Each hook call is fire-and-forget; we don't wait for the
+    # write to land before returning to Strands' tool driver.
+    bridge_loop = asyncio.get_running_loop()
+
+    def _make_inner_hook_provider(step_index: int) -> "HookProvider":
+        from strands.hooks import HookProvider, HookRegistry
+        from strands.hooks.events import (
+            AfterModelCallEvent,
+            AfterToolCallEvent,
+        )
+
+        def _schedule(coro: "asyncio.coroutines.Coroutine") -> None:
+            try:
+                asyncio.run_coroutine_threadsafe(coro, bridge_loop)
+            except RuntimeError:
+                # Loop closed — pipeline is shutting down. Drop event.
+                pass
+
+        def _on_after_model(event: AfterModelCallEvent) -> None:
+            stop = event.stop_response
+            if stop is None or stop.message is None:
+                return
+            # Concatenate text blocks of the assistant message; ignore
+            # tool_use blocks (they will be reflected in the
+            # AfterToolCallEvent below).
+            content = stop.message.get("content") or []
+            text_parts = [
+                blk.get("text", "")
+                for blk in content
+                if isinstance(blk, dict) and "text" in blk
+            ]
+            response_text = "\n".join(t for t in text_parts if t)
+            if not response_text:
+                return
+            _schedule(
+                _emit(
+                    "execute_inner",
+                    step_index,
+                    "<llm-call>",
+                    response_text,
+                    inner_origin="LLM",
+                )
+            )
+
+        def _on_after_tool(event: AfterToolCallEvent) -> None:
+            tool_name = event.tool_use.get("name", "tool")
+            tool_input = event.tool_use.get("input", {})
+            try:
+                input_str = json.dumps(tool_input, ensure_ascii=False, default=str)
+            except Exception:
+                input_str = str(tool_input)
+            # ToolResult.content is a list of content blocks; flatten
+            # the text-bearing ones for the trace.
+            result_content = event.result.get("content") or []
+            output_parts = [
+                blk.get("text", "")
+                for blk in result_content
+                if isinstance(blk, dict) and "text" in blk
+            ]
+            output_str = "\n".join(p for p in output_parts if p) or json.dumps(
+                event.result.get("status", "ok")
+            )
+            _schedule(
+                _emit(
+                    "execute_inner",
+                    step_index,
+                    input_str,
+                    output_str,
+                    inner_origin=tool_name,
+                )
+            )
+
+        class _Bridge(HookProvider):
+            def register_hooks(self, registry: HookRegistry, **_: Any) -> None:
+                registry.add_callback(AfterModelCallEvent, _on_after_model)
+                registry.add_callback(AfterToolCallEvent, _on_after_tool)
+
+        return _Bridge()
 
     usage_totals = {
         "input": 0,
@@ -660,7 +770,14 @@ async def run_per_pipeline_core(
         batch_size = len(batch)
         batch_started = time.perf_counter()
         execute_prompts = [_build_execute_input(s, artifacts) for s in batch]
-        execute_agents = [build_execute_agent() for _ in batch]
+        # One hook per step so the hook callback can hard-code the
+        # right step_index — Strands' hook events don't carry it.
+        execute_agents = [
+            build_execute_agent(
+                hooks=[_make_inner_hook_provider(steps_executed + 1 + i)]
+            )
+            for i in range(batch_size)
+        ]
 
         log_info_event(
             logger,
@@ -670,44 +787,94 @@ async def run_per_pipeline_core(
             first_step_index=steps_executed + 1,
         )
 
-        exec_outcomes = await asyncio.gather(
-            *(
-                _run_phase(agent, prompt, "execute", steps_executed + 1 + i)
-                for i, (agent, prompt) in enumerate(zip(execute_agents, execute_prompts))
+        # Emit a placeholder per step BEFORE awaiting the gather so the
+        # OSD step list can show each step as "running" (spinner +
+        # ``response`` empty). The real ``execute`` event below updates
+        # the same row with the result and flips the UI to "done".
+        for i, step_text in enumerate(batch):
+            await _emit(
+                "execute_start",
+                steps_executed + 1 + i,
+                step_text,
+                "",
             )
-        )
 
-        # Sequential post-processing — artifacts.add() and the on_phase
-        # callback both mutate state that downstream batches read, so
-        # serialize commit even though the LLM calls ran in parallel.
-        # This also guarantees the orchestrator's memory writes land in
-        # plan-step order (the frontend renders strictly by created_time
-        # ascending and has no per-step sequence number to recover from).
-        for i, (step_text, outcome) in enumerate(zip(batch, exec_outcomes)):
-            exec_result, exec_ms, exec_in, exec_out, exec_usage = outcome
-            _accumulate(exec_usage, "execute")
-            step_index = steps_executed + 1 + i
-            raw_findings = str(exec_result)
-            findings, queries, facts = _extract_sections(raw_findings)
-            artifacts.add(
-                step_index=step_index,
-                step_intent=step_text,
-                findings=findings,
-                facts=facts,
-                queries=queries,
-                tokens_in=exec_in,
-                tokens_out=exec_out,
-                elapsed_ms=exec_ms,
+        # Emit each step's result as soon as it returns, instead of
+        # waiting for the whole batch to gather. Without this, the
+        # frontend's step list jumps from 0 → batch_size in one beat
+        # — visually "a bunch of steps appeared at once" even though
+        # they finished at different times.
+        #
+        # We still run the LLM calls in parallel; only the on_phase
+        # emit (and the artifacts/state mutation it depends on) is
+        # serialized. ``asyncio.as_completed`` returns futures in
+        # finish order; the post-processing must still write artifacts
+        # in plan-step order so reflect/next-batch sees a coherent
+        # state, so we collect by step_index and flush in order as
+        # contiguous prefixes complete.
+        emit_lock = asyncio.Lock()
+
+        async def _execute_one(
+            agent: Agent, prompt: str, step_text: str, step_index: int
+        ) -> tuple[int, str, Any, int, int, int, Any]:
+            outcome = await _run_phase(agent, prompt, "execute", step_index)
+            return (step_index, step_text, *outcome)
+
+        coros = [
+            _execute_one(agent, prompt, step_text, steps_executed + 1 + i)
+            for i, (agent, prompt, step_text) in enumerate(
+                zip(execute_agents, execute_prompts, batch)
             )
-            log_info_event(
-                logger,
-                f"[per] captured {len(facts)} fact(s) and {len(queries)} query(s) from step {step_index}",
-                "per.pipeline.facts_captured",
-                step_index=step_index,
-                fact_count=len(facts),
-                query_count=len(queries),
+        ]
+
+        # Buffer out-of-order completions; flush in plan-step order.
+        completed: dict[int, tuple] = {}
+        next_to_flush = steps_executed + 1
+        for fut in asyncio.as_completed(coros):
+            step_index, step_text, exec_result, exec_ms, exec_in, exec_out, exec_usage = (
+                await fut
             )
-            await _emit("execute", step_index, step_text, raw_findings)
+            completed[step_index] = (
+                step_text,
+                exec_result,
+                exec_ms,
+                exec_in,
+                exec_out,
+                exec_usage,
+            )
+            async with emit_lock:
+                while next_to_flush in completed:
+                    (
+                        st_text,
+                        ex_res,
+                        ex_ms,
+                        ex_in,
+                        ex_out,
+                        ex_usage,
+                    ) = completed.pop(next_to_flush)
+                    _accumulate(ex_usage, "execute")
+                    raw_findings = str(ex_res)
+                    findings, queries, facts = _extract_sections(raw_findings)
+                    artifacts.add(
+                        step_index=next_to_flush,
+                        step_intent=st_text,
+                        findings=findings,
+                        facts=facts,
+                        queries=queries,
+                        tokens_in=ex_in,
+                        tokens_out=ex_out,
+                        elapsed_ms=ex_ms,
+                    )
+                    log_info_event(
+                        logger,
+                        f"[per] captured {len(facts)} fact(s) and {len(queries)} query(s) from step {next_to_flush}",
+                        "per.pipeline.facts_captured",
+                        step_index=next_to_flush,
+                        fact_count=len(facts),
+                        query_count=len(queries),
+                    )
+                    await _emit("execute", next_to_flush, st_text, raw_findings)
+                    next_to_flush += 1
 
         steps_executed += batch_size
         batch_elapsed_ms = int((time.perf_counter() - batch_started) * 1000)
@@ -719,7 +886,9 @@ async def run_per_pipeline_core(
             batch_elapsed_ms=batch_elapsed_ms,
         )
 
-        reflect_agent = build_reflect_agent()
+        reflect_agent = build_reflect_agent(
+            extra_system_prompt=extra_reflect_system_prompt,
+        )
         reflect_prompt = _build_reflect_input(
             objective=problem_statement,
             plan_steps=plan_steps,
@@ -773,18 +942,28 @@ async def run_per_pipeline_core(
     return msg
 
 
-def create_per_agent(opensearch_url: str) -> Agent:
-    """Create the PER orchestrator agent.
+_per_globals_initialized = False
+_per_obo_auth: OboAuth | None = None
 
-    Initializes a single MCP connection (shared with the executor sub-agent),
-    and returns the top-level orchestrator Agent. The PER pipeline itself
-    is exposed as the ``run_per_pipeline`` tool, which runs a transparent
-    plan → execute → reflect Python loop.
 
-    Authentication uses :class:`~utils.obo_context.OboAuth` — the
-    :class:`~server.agent_orchestrator.AgentOrchestrator` calls
-    ``set_token()`` on the orchestrator's ``_obo_auth`` before each run.
+def init_per_globals() -> OboAuth:
+    """Idempotently populate the sub_agents module-level slots.
+
+    The plan / execute / reflect builders read MCP tools and skills
+    from ``agents.per.sub_agents`` (set via ``set_mcp_client`` /
+    ``set_skills``). Both the orchestrator's lazy ``create_per_agent``
+    factory AND the standalone ``/per/investigations`` route need
+    those slots populated — but the route bypasses the orchestrator,
+    so we can't rely on ``create_per_agent`` being the trigger.
+
+    Call this once at lifespan startup. Returns the shared
+    :class:`OboAuth` so the orchestrator can attach it to the
+    top-level Agent it creates later (token / header injection).
     """
+    global _per_globals_initialized, _per_obo_auth
+    if _per_globals_initialized:
+        return _per_obo_auth  # type: ignore[return-value]
+
     if not os.getenv("BEDROCK_INFERENCE_PROFILE_ARN"):
         os.environ["BEDROCK_INFERENCE_PROFILE_ARN"] = _DEFAULT_BEDROCK_MODEL_ID
         log_info_event(
@@ -793,13 +972,6 @@ def create_per_agent(opensearch_url: str) -> Agent:
             "per_agent.default_model",
             model_id=_DEFAULT_BEDROCK_MODEL_ID,
         )
-
-    log_info_event(
-        logger,
-        f"Initializing PER agent with OpenSearch at {opensearch_url}",
-        "per_agent.initializing",
-        opensearch_url=opensearch_url,
-    )
 
     mcp_server_url = os.getenv("MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL)
 
@@ -829,6 +1001,32 @@ def create_per_agent(opensearch_url: str) -> Agent:
     # lets each builder attach a fresh ``AgentSkills`` plugin from this
     # shared list without re-scanning the filesystem each time.
     set_skills(load_all_skills(caller="per"))
+
+    _per_obo_auth = obo_auth
+    _per_globals_initialized = True
+    return obo_auth
+
+
+def create_per_agent(opensearch_url: str) -> Agent:
+    """Create the PER orchestrator agent.
+
+    Initializes a single MCP connection (shared with the executor sub-agent),
+    and returns the top-level orchestrator Agent. The PER pipeline itself
+    is exposed as the ``run_per_pipeline`` tool, which runs a transparent
+    plan → execute → reflect Python loop.
+
+    Authentication uses :class:`~utils.obo_context.OboAuth` — the
+    :class:`~server.agent_orchestrator.AgentOrchestrator` calls
+    ``set_token()`` on the orchestrator's ``_obo_auth`` before each run.
+    """
+    log_info_event(
+        logger,
+        f"Initializing PER agent with OpenSearch at {opensearch_url}",
+        "per_agent.initializing",
+        opensearch_url=opensearch_url,
+    )
+
+    obo_auth = init_per_globals()
 
     @monitored_tool(
         name="run_per_pipeline",

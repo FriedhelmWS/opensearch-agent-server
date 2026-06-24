@@ -394,7 +394,7 @@ def build_plan_agent() -> Agent:
     )
 
 
-def build_execute_agent() -> Agent:
+def build_execute_agent(hooks: list | None = None) -> Agent:
     if _mcp_tools is None:
         raise RuntimeError(
             "MCP tools not configured. Call set_mcp_client() before "
@@ -406,13 +406,37 @@ def build_execute_agent() -> Agent:
         tools=list(_mcp_tools),
         plugins=_skills_plugins(),
         name="per_execute_agent",
+        hooks=hooks,
     )
 
 
-def build_reflect_agent() -> Agent:
+def build_reflect_agent(extra_system_prompt: str | None = None) -> Agent:
+    """Build the reflect sub-agent.
+
+    ``extra_system_prompt`` is appended to ``REFLECT_SYSTEM_PROMPT``
+    when caller wants to inject domain-specific output requirements
+    without modifying the generic PER framework prompts. The
+    investigation backend uses this to enforce a structured final
+    result schema (see ``agents.investigation.prompts``).
+
+    Skills plugin is intentionally NOT attached here. The plugin
+    injects a ``skills`` tool — but reflect only consumes the prior
+    artifacts and emits a JSON decision, it never needs to look up
+    skill instructions. Worse, exposing the tool encouraged Claude
+    to fabricate XML-style ``<invoke>…</invoke>`` tool-call markup
+    inside the reflect response (especially when the structured-
+    output overlay contains long JSON schema examples); Bedrock's
+    native function-calling API doesn't recognize that markup and
+    leaves the conversation pending a tool result, which then
+    crashes the next cycle with "conversation must end with a user
+    message". Plan agent has the same risk; left untouched here
+    only because plan output is parsed differently.
+    """
+    sp = REFLECT_SYSTEM_PROMPT
+    if extra_system_prompt:
+        sp = f"{sp}\n\n{extra_system_prompt}"
     return Agent(
         model=_model(),
-        system_prompt=REFLECT_SYSTEM_PROMPT,
-        plugins=_skills_plugins(),
+        system_prompt=sp,
         name="per_reflect_agent",
     )

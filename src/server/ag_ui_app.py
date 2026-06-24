@@ -419,6 +419,20 @@ def create_app(config_override: ServerConfig | None = None) -> FastAPI:
             "ag_ui.per_agent_factory_ready",
         )
 
+        # Eagerly initialize PER's MCP client + skills slots so the
+        # /per/investigations route — which bypasses the orchestrator
+        # factory — has the sub_agents module ready on first request.
+        # Idempotent; create_per_agent's lazy path also calls this.
+        if app.state.memory_store is not None:
+            from agents.per.per_agent import init_per_globals
+
+            init_per_globals()
+            log_info_event(
+                logger,
+                "✓ PER globals initialized for /per/investigations",
+                "ag_ui.per_globals_ready",
+            )
+
         yield
 
     app = FastAPI(
